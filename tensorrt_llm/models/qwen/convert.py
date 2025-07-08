@@ -673,7 +673,7 @@ def convert_hf_qwen(hf_model,
                                        plugin_weight_only_quant_type, dtype,
                                        use_gemm_woq_plugin))
 
-        if qwen_type == "qwen2_moe" and moe_config and moe_config.has_moe():
+        if qwen_type in ("qwen2_moe", "qwen3_moe") and moe_config and moe_config.has_moe():
 
             # shared_expert for qwen2_moe
             shared_expert_up_proj = model_params[
