@@ -370,7 +370,7 @@ class QWenForCausalLM(DecoderModelForCausalLM):
                     "transformer": "language_model.model",
                     "lm_head": "language_model.lm_head",
                 }
-            elif config.qwen_type in ("qwen3", "qwen3_moe"):
+            elif config.qwen_type == "qwen3":
                 custom_dict = {
                     "q_layernorm": "q_norm",
                     "k_layernorm": "k_norm",
