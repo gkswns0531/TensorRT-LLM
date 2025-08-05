@@ -419,7 +419,8 @@ struct CutlassGemmConfig
         BLACKWELL = 1u << 4,
         GROUPED_GEMM = 1u << 5,
         FP8_ONLY = 1u << 6,
-        FP4_ONLY = 1u << 7
+        FP4_ONLY = 1u << 7,
+        FP16_SWIGLU = 1u << 10
     };
 
     CutlassTileConfig tile_config_sm80 = CutlassTileConfig::ChooseWithHeuristic;

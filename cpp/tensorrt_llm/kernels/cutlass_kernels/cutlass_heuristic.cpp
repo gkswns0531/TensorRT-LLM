@@ -111,6 +111,82 @@ bool is_valid_split_k_factor(int64_t const m, int64_t const n, int64_t const k, 
     return true;
 }
 
+std::vector<CutlassTileConfig> get_candidate_tiles_fp16_swiglu_sm80(
+    CutlassGemmConfig::CandidateConfigTypeParam const config_type_param)
+{
+    // A100 FP16 SwiGLU optimized configurations
+    // Based on research achieving 95% cuBLAS performance on RTX3090/A6000
+    std::vector<CutlassTileConfig> a100_configs = {
+        // Small batch: latency optimization
+        CutlassTileConfig::CtaShape64x256x32_WarpShape32x64x32,
+        CutlassTileConfig::CtaShape32x256x64_WarpShape32x32x64,
+        
+        // Medium batch: balanced optimization  
+        CutlassTileConfig::CtaShape128x256x32_WarpShape64x64x32,
+        CutlassTileConfig::CtaShape64x256x64_WarpShape32x64x64,
+        
+        // Large batch: throughput optimization
+        CutlassTileConfig::CtaShape256x128x32_WarpShape64x64x32,
+        CutlassTileConfig::CtaShape128x256x64_WarpShape64x64x64,
+        
+        // Memory intensive: large K dimension
+        CutlassTileConfig::CtaShape128x128x64_WarpShape32x64x64,
+        CutlassTileConfig::CtaShape64x128x128_WarpShape32x32x128
+    };
+    
+    return a100_configs;
+}
+
+std::vector<CutlassTileConfig> get_candidate_tiles_fp16_swiglu_sm70(
+    CutlassGemmConfig::CandidateConfigTypeParam const config_type_param)
+{
+    // V100 FP16 SwiGLU configurations
+    // Based on NVIDIA Volta Tuning Guide recommendations
+    std::vector<CutlassTileConfig> v100_configs = {
+        // Balanced optimization
+        CutlassTileConfig::CtaShape128x128x32_WarpShape64x64x32,
+        
+        // Small batch optimization
+        CutlassTileConfig::CtaShape64x128x32_WarpShape32x64x32,
+        CutlassTileConfig::CtaShape128x64x32_WarpShape64x32x32,
+        
+        // Memory efficient
+        CutlassTileConfig::CtaShape64x64x32_WarpShape32x32x32,
+        
+        // High memory bandwidth utilization (HBM2)
+        CutlassTileConfig::CtaShape128x128x16_WarpShape64x64x16,
+        CutlassTileConfig::CtaShape64x256x16_WarpShape32x64x16,
+        CutlassTileConfig::CtaShape256x64x16_WarpShape64x32x16
+    };
+    
+    return v100_configs;
+}
+
+std::vector<CutlassTileConfig> get_candidate_tiles_fp16_swiglu_sm89(
+    CutlassGemmConfig::CandidateConfigTypeParam const config_type_param)
+{
+    // L4/L40S FP16 SwiGLU configurations  
+    // Based on Ada Lovelace 4th gen Tensor Core optimization
+    std::vector<CutlassTileConfig> ada_configs = {
+        // Power efficient (L4 optimized)
+        CutlassTileConfig::CtaShape64x64x32_WarpShape32x32x32,
+        CutlassTileConfig::CtaShape64x128x32_WarpShape32x64x32,
+        
+        // Balanced (L4/L40S)
+        CutlassTileConfig::CtaShape128x64x32_WarpShape64x32x32,
+        CutlassTileConfig::CtaShape128x128x32_WarpShape64x64x32,
+        
+        // High bandwidth (L40S optimized) 
+        CutlassTileConfig::CtaShape256x128x32_WarpShape64x64x32,
+        CutlassTileConfig::CtaShape128x256x32_WarpShape64x64x32,
+        
+        // Memory optimized
+        CutlassTileConfig::CtaShape128x128x64_WarpShape64x64x64
+    };
+    
+    return ada_configs;
+}
+
 std::vector<CutlassTileConfig> get_candidate_tiles(
     int const sm, CutlassGemmConfig::CandidateConfigTypeParam const config_type_param)
 {
@@ -120,7 +196,8 @@ std::vector<CutlassTileConfig> get_candidate_tiles(
         WeightOnly,
         Simt,
         Int8,
-        Fp8
+        Fp8,
+        Fp16Swiglu
     };
 
     CutlassGemmType gemm_type = CutlassGemmType::Default;
@@ -139,6 +216,10 @@ std::vector<CutlassTileConfig> get_candidate_tiles(
     else if (config_type_param & CutlassGemmConfig::FP8_ONLY)
     {
         gemm_type = CutlassGemmType::Fp8;
+    }
+    else if (config_type_param & CutlassGemmConfig::FP16_SWIGLU)
+    {
+        gemm_type = CutlassGemmType::Fp16Swiglu;
     }
 
     std::vector<CutlassTileConfig> base_configs{
@@ -212,6 +293,25 @@ std::vector<CutlassTileConfig> get_candidate_tiles(
             {
                 return {};
             }
+        }
+    case CutlassGemmType::Fp16Swiglu:
+        if (sm == 80) {  // A100
+            return get_candidate_tiles_fp16_swiglu_sm80(config_type_param);
+        }
+        else if (sm == 89) {  // L4, L40S
+            return get_candidate_tiles_fp16_swiglu_sm89(config_type_param);
+        }
+        else if (sm == 70) {  // V100
+            return get_candidate_tiles_fp16_swiglu_sm70(config_type_param);
+        }
+        else if (sm == 90) {  // H100 - future FP16 support
+            // H100 FP16 to be implemented later, use A100 configs for now
+            return get_candidate_tiles_fp16_swiglu_sm80(config_type_param);
+        }
+        else
+        {
+            // Fallback to base configs for unsupported architectures
+            return base_configs;
         }
     default: return base_configs;
     }
@@ -528,6 +628,38 @@ std::vector<CutlassGemmConfig> get_candidate_configs(
     if (sm >= 120 && (config_type_param & CutlassGemmConfig::BLACKWELL))
     {
         return get_candidate_configs_sm120(config_type_param);
+    }
+
+    // FP16 SwiGLU specialized configuration generation
+    if (config_type_param & CutlassGemmConfig::FP16_SWIGLU)
+    {
+        std::vector<CutlassTileConfig> tiles = get_candidate_tiles(sm, config_type_param);
+        std::vector<CutlassGemmConfig> candidate_configs;
+        
+        // FP16 SwiGLU optimized settings
+        int const min_stages = 2;  // Memory optimization
+        int const max_stages = 4;  // A100 optimal
+        
+        for (auto const& tile_config : tiles)
+        {
+            for (int stages = min_stages; stages <= max_stages; ++stages)
+            {
+                CutlassGemmConfig config(tile_config, SplitKStyle::NO_SPLIT_K, 1, stages);
+                candidate_configs.push_back(config);
+                
+                // Split-K experiments for A100+ (SM80+)
+                if (sm >= 80)
+                {
+                    for (int split_k_factor = 2; split_k_factor <= max_split_k; ++split_k_factor)
+                    {
+                        auto split_config = CutlassGemmConfig{tile_config, SplitKStyle::SPLIT_K_SERIAL, 
+                                                            split_k_factor, stages};
+                        candidate_configs.push_back(split_config);
+                    }
+                }
+            }
+        }
+        return candidate_configs;
     }
 
     std::vector<CutlassTileConfig> tiles = get_candidate_tiles(sm, config_type_param);

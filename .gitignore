@@ -72,3 +72,4 @@ compile_commands.json
 .dir-locals.el
 .devcontainer/devcontainer.env.user
 .devcontainer/docker-compose.override.yml
+test_swiglu_fp16_extension/
