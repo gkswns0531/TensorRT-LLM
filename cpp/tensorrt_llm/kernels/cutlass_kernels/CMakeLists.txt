@@ -197,6 +197,11 @@ set(GEMM_SWIGLU_SM90_SRC_CU
 add_library(gemm_swiglu_sm90_src STATIC ${GEMM_SWIGLU_SM90_SRC_CU})
 set_cuda_architectures(gemm_swiglu_sm90_src 90)
 
+set(GEMM_SWIGLU_FP16_SRC_CU
+    ${CMAKE_CURRENT_SOURCE_DIR}/fused_gated_gemm/gemm_swiglu_fp16.cu)
+add_library(gemm_swiglu_fp16_src STATIC ${GEMM_SWIGLU_FP16_SRC_CU})
+set_cuda_architectures(gemm_swiglu_fp16_src 80 89 90)
+
 if(USING_OSS_CUTLASS_LOW_LATENCY_GEMM)
   file(GLOB LOW_LATENCY_GEMM_SRC_CU
        "${CMAKE_CURRENT_SOURCE_DIR}/low_latency_gemm/*.cu")
@@ -263,7 +268,7 @@ endif()
 set(ALL_KERNELS_LIB)
 
 set(TARGET_LIB
-    fpA_intB_gemm_src;fb_gemm_src;fp8_blockscale_gemm_src;gemm_swiglu_sm90_src)
+    fpA_intB_gemm_src;fb_gemm_src;fp8_blockscale_gemm_src;gemm_swiglu_sm90_src;gemm_swiglu_fp16_src)
 if(USING_OSS_CUTLASS_LOW_LATENCY_GEMM)
   list(APPEND TARGET_LIB low_latency_gemm_src)
 endif()

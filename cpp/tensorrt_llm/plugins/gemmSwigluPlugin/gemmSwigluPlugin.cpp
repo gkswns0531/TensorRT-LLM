@@ -149,9 +149,17 @@ void GemmSwigluPlugin::init(nvinfer1::DataType type)
     {
         mGemmRunner = std::make_shared<CutlassFusedGatedGemmRunner<__nv_fp8_e4m3>>();
     }
+    else if (mType == nvinfer1::DataType::kHALF)
+    {
+        mGemmRunner = std::make_shared<CutlassFusedGatedGemmRunner<half>>();
+    }
+    else if (mType == nvinfer1::DataType::kBF16)
+    {
+        mGemmRunner = std::make_shared<CutlassFusedGatedGemmRunner<__nv_bfloat16>>();
+    }
     else
     {
-        TLLM_THROW("Gemm Swiglu plugin only supports fp8 now");
+        TLLM_THROW("Gemm Swiglu plugin supports fp8, fp16, and bf16 precisions");
     }
 
     mPluginProfiler->setQuantMode(mQuantMode);
