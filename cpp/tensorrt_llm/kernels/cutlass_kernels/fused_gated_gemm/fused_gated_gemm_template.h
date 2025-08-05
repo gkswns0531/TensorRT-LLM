@@ -32,6 +32,7 @@
 #endif          // __GNUC
 
 #include "fused_gated_gemm.h"
+#include "fused_gated_gemm_kernel_template_sm80.h"
 #include "fused_gated_gemm_kernel_template_sm90.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/quantization.h"
@@ -140,6 +141,42 @@ typename Gemm::Arguments prepareGemmArgsSm90(void* D, void const* A, void const*
     return args;
 }
 
+template <typename T, typename ThreadblockShape, typename WarpShape,
+    template <class> typename Activation = cutlass::epilogue::thread::SiLu, bool SwapAB = true>
+size_t genericGemmGatedKernelLauncherSm80(void* D, void const* A, void const* B, void const* C_bias,
+    tk::QuantMode quantOption, int m, int n, int k, float scale_d0, float scale_d1, float scale_output,
+    tkc::CutlassGemmConfig gemmConfig, char* workspace, size_t workspaceBytes, cudaStream_t stream,
+    int* occupancy = nullptr)
+{
+    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    
+    using ElementT = typename TllmToCutlassTypeAdapter<T>::type;
+    using AccumElementType = float;
+    using CTAShape = ThreadblockShape;
+    using ClusterShape = cute::Shape<cute::_1, cute::_1, cute::_1>;  // SM80 uses 1x1x1 cluster
+    
+    // SM80 scheduling (no TMA, uses traditional scheduling)
+    using MainloopScheduleType = cutlass::gemm::KernelMultistage<gemmConfig.stages>;
+    using EpilogueScheduleType = cutlass::epilogue::thread::LinearCombination<
+        ElementT, 128 / cutlass::sizeof_bits<ElementT>::value, AccumElementType, AccumElementType>;
+    using TileSchedulerType = void;
+    
+    using Gemm = typename DeviceGemmGatedSm80<ElementT, AccumElementType, CTAShape, ClusterShape, 
+        MainloopScheduleType, EpilogueScheduleType, TileSchedulerType, Activation, SwapAB>::Gemm;
+    
+    // Prepare arguments for SM80 (no cluster scheduling needed)
+    typename Gemm::Arguments args{
+        cutlass::gemm::GemmCoord{m, n, k},
+        {static_cast<ElementT const*>(A), m},
+        {static_cast<ElementT const*>(B), k},
+        {static_cast<ElementT const*>(C_bias), n},
+        {static_cast<ElementT*>(D), n},
+        {scale_d0, scale_d1}
+    };
+    
+    return typedGemmGatedKernelLauncher(Gemm{}, args, D, A, B, C_bias, workspace, workspaceBytes, stream, occupancy);
+}
+
 template <typename T, typename CTAShape, typename ClusterShape,
     template <class> typename Activation = cutlass::epilogue::thread::SiLu, bool SwapAB = true>
 size_t genericGemmGatedKernelLauncherSm90(void* D, void const* A, void const* B, void const* C_bias,
@@ -205,6 +242,72 @@ size_t dispatchGemmConfigSm90(void* D, void const* A, void const* B, void const*
     default:
         throw std::runtime_error(
             "[TensorRT-LLM Error][CutlassFusedGatedGemmRunner][dispatchGemmConfigSm90] Config is invalid for fused "
+            "gated GEMM.");
+        break;
+    }
+}
+
+// SM80 FP16 SwiGLU dispatch functions
+template <typename T, typename ThreadblockShape, typename WarpShape>
+size_t dispatchGemmConfigSm80FP16(void* D, void const* A, void const* B, void const* C_bias, tk::QuantMode quantOption,
+    int m, int n, int k, float scale_d0, float scale_d1, float scale_output, tkc::CutlassGemmConfig gemmConfig,
+    char* workspace, size_t workspaceBytes, cudaStream_t stream, int* occupancy = nullptr)
+{
+    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    static_assert(std::is_same_v<T, half> || std::is_same_v<T, __nv_bfloat16>, 
+                  "dispatchGemmConfigSm80FP16 supports FP16 and BF16");
+    
+    return genericGemmGatedKernelLauncherSm80<T, ThreadblockShape, WarpShape>(
+        D, A, B, C_bias, quantOption, m, n, k, scale_d0, scale_d1, scale_output, 
+        gemmConfig, workspace, workspaceBytes, stream, occupancy);
+}
+
+template <typename T>
+size_t dispatchGemmToCutlassSm80FP16(void* D, void const* A, void const* B, void const* C_bias, tk::QuantMode quantOption,
+    int m, int n, int k, float scale_d0, float scale_d1, float scale_output, tkc::CutlassGemmConfig gemmConfig,
+    char* workspace, size_t workspaceBytes, cudaStream_t stream, int* occupancy = nullptr)
+{
+    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    static_assert(std::is_same_v<T, half>, "dispatchGemmToCutlassSm80FP16 only supports FP16");
+    
+    switch (gemmConfig.tile_config_sm80)
+    {
+    case tkc::CutlassTileConfig::CtaShape64x256x32_WarpShape32x64x32:
+        return dispatchGemmConfigSm80FP16<T, cutlass::gemm::GemmShape<64, 256, 32>, 
+               cutlass::gemm::GemmShape<32, 64, 32>>(D, A, B, C_bias, quantOption, 
+               m, n, k, scale_d0, scale_d1, scale_output, gemmConfig, workspace, 
+               workspaceBytes, stream, occupancy);
+        break;
+    case tkc::CutlassTileConfig::CtaShape128x256x32_WarpShape64x64x32:
+        return dispatchGemmConfigSm80FP16<T, cutlass::gemm::GemmShape<128, 256, 32>, 
+               cutlass::gemm::GemmShape<64, 64, 32>>(D, A, B, C_bias, quantOption, 
+               m, n, k, scale_d0, scale_d1, scale_output, gemmConfig, workspace, 
+               workspaceBytes, stream, occupancy);
+        break;
+    case tkc::CutlassTileConfig::CtaShape256x128x32_WarpShape64x64x32:
+        return dispatchGemmConfigSm80FP16<T, cutlass::gemm::GemmShape<256, 128, 32>, 
+               cutlass::gemm::GemmShape<64, 64, 32>>(D, A, B, C_bias, quantOption, 
+               m, n, k, scale_d0, scale_d1, scale_output, gemmConfig, workspace, 
+               workspaceBytes, stream, occupancy);
+        break;
+    case tkc::CutlassTileConfig::CtaShape128x128x64_WarpShape32x64x64:
+        return dispatchGemmConfigSm80FP16<T, cutlass::gemm::GemmShape<128, 128, 64>, 
+               cutlass::gemm::GemmShape<32, 64, 64>>(D, A, B, C_bias, quantOption, 
+               m, n, k, scale_d0, scale_d1, scale_output, gemmConfig, workspace, 
+               workspaceBytes, stream, occupancy);
+        break;
+    case tkc::CutlassTileConfig::Undefined:
+        throw std::runtime_error(
+            "[TensorRT-LLm Error][CutlassFusedGatedGemmRunner][dispatchGemmToCutlassSm80FP16] gemm config undefined.");
+        break;
+    case tkc::CutlassTileConfig::ChooseWithHeuristic:
+        throw std::runtime_error(
+            "[TensorRT-LLm Error][CutlassFusedGatedGemmRunner][dispatchGemmToCutlassSm80FP16] gemm config should have "
+            "already been set by heuristic.");
+        break;
+    default:
+        throw std::runtime_error(
+            "[TensorRT-LLm Error][CutlassFusedGatedGemmRunner][dispatchGemmToCutlassSm80FP16] Config is invalid for fused "
             "gated GEMM.");
         break;
     }
@@ -306,12 +409,59 @@ size_t CutlassFusedGatedGemmRunner<T>::dispatchToArch(void* D, void const* A, vo
                 "gated GEMM");
         }
     }
+    else if constexpr (std::is_same_v<T, half>)
+    {
+        // FP16 SwiGLU support for multiple architectures
+        if (mSm == 80)  // A100
+        {
+            return dispatchGemmToCutlassSm80FP16<T>(D, A, B, C_bias, quantOption, m, n, k, scale_d0, scale_d1, scale_output,
+                gemmConfig, workspace, workspaceBytes, stream, occupancy);
+        }
+        else if (mSm == 70)  // V100
+        {
+            // TODO: Implement V100 dispatch in next iteration
+            throw std::runtime_error(
+                "[TensorRT-LLM Error][CutlassFusedGatedGemmRunner][GEMM Dispatch] V100 FP16 SwiGLU not yet implemented");
+        }
+        else if (mSm == 89)  // L4, L40S
+        {
+            // TODO: Implement L4/L40S dispatch in next iteration
+            throw std::runtime_error(
+                "[TensorRT-LLM Error][CutlassFusedGatedGemmRunner][GEMM Dispatch] L4/L40S FP16 SwiGLU not yet implemented");
+        }
+        else if (mSm == 90)  // H100 - future FP16 support
+        {
+            // Use A100 dispatch for now
+            return dispatchGemmToCutlassSm80FP16<T>(D, A, B, C_bias, quantOption, m, n, k, scale_d0, scale_d1, scale_output,
+                gemmConfig, workspace, workspaceBytes, stream, occupancy);
+        }
+        else
+        {
+            throw std::runtime_error(
+                "[TensorRT-LLM Error][CutlassFusedGatedGemmRunner][GEMM Dispatch] Arch unsupported for FP16 SwiGLU: SM" 
+                + std::to_string(mSm));
+        }
+    }
+    else if constexpr (std::is_same_v<T, __nv_bfloat16>)
+    {
+        // BF16 SwiGLU support (same dispatch as FP16)
+        if (mSm == 80)  // A100
+        {
+            return dispatchGemmToCutlassSm80FP16<T>(D, A, B, C_bias, quantOption, m, n, k, scale_d0, scale_d1, scale_output,
+                gemmConfig, workspace, workspaceBytes, stream, occupancy);
+        }
+        else
+        {
+            throw std::runtime_error(
+                "[TensorRT-LLM Error][CutlassFusedGatedGemmRunner][GEMM Dispatch] BF16 SwiGLU only supported on A100+ (SM80+): SM" 
+                + std::to_string(mSm));
+        }
+    }
     else
     {
         throw std::runtime_error(
             "[TensorRT-LLM Error][CutlassFusedGatedGemmRunner][GEMM Dispatch] dtype unsupported for CUTLASS fused "
-            "gated "
-            "GEMM");
+            "gated GEMM");
     }
     return 0;
 }
@@ -375,12 +525,28 @@ std::vector<tkc::CutlassGemmConfig> CutlassFusedGatedGemmRunner<T>::getConfigs()
             }
         }
     }
+    else if constexpr (std::is_same_v<T, half> || std::is_same_v<T, __nv_bfloat16>)
+    {
+        // FP16/BF16 SwiGLU support
+        if (mSm >= 70)  // V100+
+        {
+            tkc::CutlassGemmConfig::CandidateConfigTypeParam config_type_param
+                = tkc::CutlassGemmConfig::CandidateConfigTypeParam::FP16_SWIGLU;
+            std::vector<CutlassGemmConfig> commonConfigs = get_candidate_configs(mSm, 8, config_type_param);
+            candidateConfigs.insert(candidateConfigs.end(), commonConfigs.begin(), commonConfigs.end());
+        }
+        else
+        {
+            throw std::runtime_error(
+                "[TensorRT-LLM Error][CutlassFusedGatedGemmRunner][getConfigs] FP16/BF16 SwiGLU requires SM70+ (V100+). "
+                "Current: SM" + std::to_string(mSm));
+        }
+    }
     else
     {
         throw std::runtime_error(
             "[TensorRT-LLM Error][CutlassFusedGatedGemmRunner][GEMM Dispatch] dtype unsupported for CUTLASS fused "
-            "gated "
-            "GEMM");
+            "gated GEMM");
     }
     return candidateConfigs;
 }
