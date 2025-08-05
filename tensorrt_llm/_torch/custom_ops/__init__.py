@@ -1,5 +1,6 @@
 from .cpp_custom_ops import _register_fake
 from .flashinfer_custom_ops import IS_FLASHINFER_AVAILABLE
+from .fused_gemm_swiglu import fused_gemm_swiglu_dense, can_use_gemm_swiglu_fusion, get_fusion_info
 from .torch_custom_ops import bmm_out
 from .trtllm_gen_custom_ops import fp8_block_scale_moe_runner
 from .userbuffers_custom_ops import add_to_ub, copy_to_userbuffers, matmul_to_ub
@@ -9,6 +10,9 @@ __all__ = [
     '_register_fake',
     'bmm_out',
     'fp8_block_scale_moe_runner',
+    'fused_gemm_swiglu_dense',
+    'can_use_gemm_swiglu_fusion',
+    'get_fusion_info',
     'add_to_ub',
     'copy_to_userbuffers',
     'matmul_to_ub',

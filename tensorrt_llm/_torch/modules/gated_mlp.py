@@ -1,5 +1,6 @@
 from collections.abc import Callable
 from typing import Optional, Union
+import os
 
 import torch
 import torch.nn.functional as F
@@ -37,12 +38,20 @@ class GatedMLP(nn.Module):
                  config: Optional[ModelConfig] = None,
                  overridden_tp_size: Optional[int] = None,
                  reduce_output: bool = True,
-                 layer_idx: Optional[int] = None):
+                 layer_idx: Optional[int] = None,
+                 enable_fused_gemm_swiglu: bool = False):
         super().__init__()
         self.layer_idx = layer_idx
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.activation = activation
+        
+        # Check environment variable for fusion control
+        env_fusion = os.environ.get('TRTLLM_ENABLE_GEMM_SWIGLU_FUSION', '0')
+        self.enable_fused_gemm_swiglu = enable_fused_gemm_swiglu or env_fusion == '1'
+        
+        if self.enable_fused_gemm_swiglu and env_fusion == '1':
+            print(f"[DEBUG] GatedMLP layer {layer_idx}: SwiGLU fusion ENABLED")
 
         config = config or ModelConfig()
         self.mapping = config.mapping
@@ -129,6 +138,34 @@ class GatedMLP(nn.Module):
             return self.forward_lora(x, all_rank_num_tokens,
                                      final_all_reduce_params, lora_params)
 
+        # Try GEMM+SwiGLU fusion (following min_latency pattern)
+        if (self.enable_fused_gemm_swiglu and 
+            self.activation == F.silu and
+            isinstance(x, torch.Tensor) and
+            not isinstance(x, Fp4QuantizedTensor)):
+            
+            try:
+                from ..custom_ops import fused_gemm_swiglu_dense, can_use_gemm_swiglu_fusion
+                
+                gate_up_weight = self.gate_up_proj.weight
+                gate_up_bias = getattr(self.gate_up_proj, 'bias', None)
+                
+                if can_use_gemm_swiglu_fusion(x, gate_up_weight, gate_up_bias):
+                    print(f"[DEBUG] Using FUSION for layer {self.layer_idx}")
+                    # Fusion path: GEMM+SwiGLU in single operation
+                    h2 = fused_gemm_swiglu_dense(x, gate_up_weight, gate_up_bias)
+                    output = self.down_proj(h2,
+                                          all_reduce_params=final_all_reduce_params,
+                                          layer_idx=self.layer_idx)
+                    return output
+                else:
+                    print(f"[DEBUG] Fusion validation FAILED for layer {self.layer_idx}")
+            except Exception as e:
+                print(f"[DEBUG] Fusion ERROR for layer {self.layer_idx}: {e}")
+                # Fallback to standard path on any fusion error
+                pass
+
+        # Standard path: separate GEMM and activation
         h1 = self.gate_up_proj(x)
         h2 = self._apply_activation(h1)
         output = self.down_proj(h2,
