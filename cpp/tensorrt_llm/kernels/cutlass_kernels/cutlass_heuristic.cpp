@@ -270,7 +270,7 @@ std::vector<CutlassTileConfig> get_candidate_tiles(
             return get_candidate_tiles_fp16_swiglu_sm70(config_type_param);
         }
         else if (sm == 90) {
-            return get_candidate_tiles_fp16_swiglu_sm80(config_type_param);
+            return base_configs;
         }
         else
         {
@@ -301,6 +301,13 @@ std::vector<CutlassTileConfigSM90> get_candidate_tiles_sm90(CutlassGemmConfig::C
                 CutlassTileConfigSM90::CtaShape128x64x128B, CutlassTileConfigSM90::CtaShape128x128x128B,
                 CutlassTileConfigSM90::CtaShape128x256x128B, CutlassTileConfigSM90::CtaShape256x128x128B};
         }
+    }
+    else if (config & CutlassGemmConfig::FP16_SWIGLU)
+    {
+        return {CutlassTileConfigSM90::CtaShape64x64x128B, CutlassTileConfigSM90::CtaShape64x128x128B,
+            CutlassTileConfigSM90::CtaShape128x64x128B, CutlassTileConfigSM90::CtaShape128x128x128B,
+            CutlassTileConfigSM90::CtaShape128x256x128B, CutlassTileConfigSM90::CtaShape256x128x128B,
+            CutlassTileConfigSM90::CtaShape64x256x128B};
     }
     else
     {
@@ -580,7 +587,7 @@ std::vector<CutlassGemmConfig> get_candidate_configs(
         return {};
     }
 
-    if (sm == 90 && (config_type_param & CutlassGemmConfig::HOPPER))
+    if (sm == 90 && ((config_type_param & CutlassGemmConfig::HOPPER) || (config_type_param & CutlassGemmConfig::FP16_SWIGLU)))
     {
         return get_candidate_configs_sm90(config_type_param);
     }
