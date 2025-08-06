@@ -153,26 +153,17 @@ size_t genericGemmGatedKernelLauncherSm80(void* D, void const* A, void const* B,
     using ElementT = typename TllmToCutlassTypeAdapter<T>::type;
     using AccumElementType = float;
     using CTAShape = ThreadblockShape;
-    using ClusterShape = cute::Shape<cute::_1, cute::_1, cute::_1>;  // SM80 uses 1x1x1 cluster
+    using ClusterShape = cute::Shape<cute::_1, cute::_1, cute::_1>;
     
-    // SM80 scheduling (no TMA, uses traditional scheduling)
-    using MainloopScheduleType = cutlass::gemm::KernelMultistage<gemmConfig.stages>;
-    using EpilogueScheduleType = cutlass::epilogue::thread::LinearCombination<
-        ElementT, 128 / cutlass::sizeof_bits<ElementT>::value, AccumElementType, AccumElementType>;
+    using MainloopScheduleType = cutlass::gemm::KernelTmaWarpSpecialized;
+    using EpilogueScheduleType = cutlass::epilogue::TmaWarpSpecialized;
     using TileSchedulerType = void;
     
     using Gemm = typename DeviceGemmGatedSm80<ElementT, AccumElementType, CTAShape, ClusterShape, 
         MainloopScheduleType, EpilogueScheduleType, TileSchedulerType, Activation, SwapAB>::Gemm;
     
-    // Prepare arguments for SM80 (no cluster scheduling needed)
-    typename Gemm::Arguments args{
-        cutlass::gemm::GemmCoord{m, n, k},
-        {static_cast<ElementT const*>(A), m},
-        {static_cast<ElementT const*>(B), k},
-        {static_cast<ElementT const*>(C_bias), n},
-        {static_cast<ElementT*>(D), n},
-        {scale_d0, scale_d1}
-    };
+    typename Gemm::Arguments args = makeGemmGatedArgs<ElementT>(
+        A, B, C_bias, D, m, n, k, scale_d0, scale_d1, scale_output);
     
     return typedGemmGatedKernelLauncher(Gemm{}, args, D, A, B, C_bias, workspace, workspaceBytes, stream, occupancy);
 }
@@ -268,7 +259,8 @@ size_t dispatchGemmToCutlassSm80FP16(void* D, void const* A, void const* B, void
     char* workspace, size_t workspaceBytes, cudaStream_t stream, int* occupancy = nullptr)
 {
     TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
-    static_assert(std::is_same_v<T, half>, "dispatchGemmToCutlassSm80FP16 only supports FP16");
+    static_assert(std::is_same_v<T, half> || std::is_same_v<T, __nv_bfloat16>, 
+                  "dispatchGemmToCutlassSm80FP16 supports FP16 and BF16");
     
     switch (gemmConfig.tile_config_sm80)
     {
@@ -419,15 +411,13 @@ size_t CutlassFusedGatedGemmRunner<T>::dispatchToArch(void* D, void const* A, vo
         }
         else if (mSm == 70)  // V100
         {
-            // TODO: Implement V100 dispatch in next iteration
-            throw std::runtime_error(
-                "[TensorRT-LLM Error][CutlassFusedGatedGemmRunner][GEMM Dispatch] V100 FP16 SwiGLU not yet implemented");
+            return dispatchGemmToCutlassSm80FP16<T>(D, A, B, C_bias, quantOption, m, n, k, scale_d0, scale_d1, scale_output,
+                gemmConfig, workspace, workspaceBytes, stream, occupancy);
         }
         else if (mSm == 89)  // L4, L40S
         {
-            // TODO: Implement L4/L40S dispatch in next iteration
-            throw std::runtime_error(
-                "[TensorRT-LLM Error][CutlassFusedGatedGemmRunner][GEMM Dispatch] L4/L40S FP16 SwiGLU not yet implemented");
+            return dispatchGemmToCutlassSm80FP16<T>(D, A, B, C_bias, quantOption, m, n, k, scale_d0, scale_d1, scale_output,
+                gemmConfig, workspace, workspaceBytes, stream, occupancy);
         }
         else if (mSm == 90)  // H100 - future FP16 support
         {
@@ -450,10 +440,15 @@ size_t CutlassFusedGatedGemmRunner<T>::dispatchToArch(void* D, void const* A, vo
             return dispatchGemmToCutlassSm80FP16<T>(D, A, B, C_bias, quantOption, m, n, k, scale_d0, scale_d1, scale_output,
                 gemmConfig, workspace, workspaceBytes, stream, occupancy);
         }
+        else if (mSm == 70 || mSm == 89 || mSm == 90)
+        {
+            return dispatchGemmToCutlassSm80FP16<T>(D, A, B, C_bias, quantOption, m, n, k, scale_d0, scale_d1, scale_output,
+                gemmConfig, workspace, workspaceBytes, stream, occupancy);
+        }
         else
         {
             throw std::runtime_error(
-                "[TensorRT-LLM Error][CutlassFusedGatedGemmRunner][GEMM Dispatch] BF16 SwiGLU only supported on A100+ (SM80+): SM" 
+                "[TensorRT-LLM Error][CutlassFusedGatedGemmRunner][GEMM Dispatch] BF16 SwiGLU only supported on SM70+ (V100+): SM" 
                 + std::to_string(mSm));
         }
     }
