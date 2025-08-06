@@ -114,56 +114,42 @@ bool is_valid_split_k_factor(int64_t const m, int64_t const n, int64_t const k, 
 std::vector<CutlassTileConfig> get_candidate_tiles_fp16_swiglu_sm80(
     CutlassGemmConfig::CandidateConfigTypeParam const config_type_param)
 {
-    std::vector<CutlassTileConfig> a100_configs = {
-        CutlassTileConfig::CtaShape64x256x32_WarpShape32x64x32,
-        CutlassTileConfig::CtaShape32x256x64_WarpShape32x32x64,
-        CutlassTileConfig::CtaShape128x256x32_WarpShape64x64x32,
-        CutlassTileConfig::CtaShape64x256x64_WarpShape32x64x64,
-        CutlassTileConfig::CtaShape256x128x32_WarpShape64x64x32,
+    return {
+        CutlassTileConfig::CtaShape64x128x64_WarpShape32x64x64,
+        CutlassTileConfig::CtaShape128x128x64_WarpShape64x64x64,
         CutlassTileConfig::CtaShape128x256x64_WarpShape64x64x64,
-        CutlassTileConfig::CtaShape128x128x64_WarpShape32x64x64,
-        CutlassTileConfig::CtaShape64x128x128_WarpShape32x32x128
+        CutlassTileConfig::CtaShape256x128x64_WarpShape64x64x64,
+        CutlassTileConfig::CtaShape128x64x64_WarpShape64x32x64,
+        CutlassTileConfig::CtaShape64x64x128_WarpShape32x64x64,
+        CutlassTileConfig::CtaShape128x64x128_WarpShape64x32x128
     };
-    
-    return a100_configs;
 }
 
 std::vector<CutlassTileConfig> get_candidate_tiles_fp16_swiglu_sm70(
     CutlassGemmConfig::CandidateConfigTypeParam const config_type_param)
 {
-    std::vector<CutlassTileConfig> v100_configs = {
-        CutlassTileConfig::CtaShape128x128x32_WarpShape64x64x32,
-        CutlassTileConfig::CtaShape64x128x32_WarpShape32x64x32,
-        CutlassTileConfig::CtaShape128x64x32_WarpShape64x32x32,
-        
-        CutlassTileConfig::CtaShape64x64x32_WarpShape32x32x32,
-        
-        CutlassTileConfig::CtaShape128x128x16_WarpShape64x64x16,
-        CutlassTileConfig::CtaShape64x256x16_WarpShape32x64x16,
-        CutlassTileConfig::CtaShape256x64x16_WarpShape64x32x16
+    return {
+        CutlassTileConfig::CtaShape32x128x64_WarpShape32x32x64,
+        CutlassTileConfig::CtaShape64x128x64_WarpShape32x64x64,
+        CutlassTileConfig::CtaShape128x128x64_WarpShape64x32x64,
+        CutlassTileConfig::CtaShape128x64x64_WarpShape64x32x64,
+        CutlassTileConfig::CtaShape64x64x128_WarpShape32x64x64,
+        CutlassTileConfig::CtaShape128x128x8_WarpShape64x64x8
     };
-    
-    return v100_configs;
 }
 
 std::vector<CutlassTileConfig> get_candidate_tiles_fp16_swiglu_sm89(
     CutlassGemmConfig::CandidateConfigTypeParam const config_type_param)
 {
-    
-    std::vector<CutlassTileConfig> ada_configs = {
-        CutlassTileConfig::CtaShape64x64x32_WarpShape32x32x32,
-        CutlassTileConfig::CtaShape64x128x32_WarpShape32x64x32,
-        
-        CutlassTileConfig::CtaShape128x64x32_WarpShape64x32x32,
-        CutlassTileConfig::CtaShape128x128x32_WarpShape64x64x32,
-        
-        CutlassTileConfig::CtaShape256x128x32_WarpShape64x64x32,
-        CutlassTileConfig::CtaShape128x256x32_WarpShape64x64x32,
-        
-        CutlassTileConfig::CtaShape128x128x64_WarpShape64x64x64
+    return {
+        CutlassTileConfig::CtaShape32x128x64_WarpShape32x32x64,
+        CutlassTileConfig::CtaShape64x128x64_WarpShape32x64x64,
+        CutlassTileConfig::CtaShape128x64x64_WarpShape64x32x64,
+        CutlassTileConfig::CtaShape128x128x64_WarpShape64x64x64,
+        CutlassTileConfig::CtaShape128x256x64_WarpShape64x64x64,
+        CutlassTileConfig::CtaShape256x128x64_WarpShape64x64x64,
+        CutlassTileConfig::CtaShape64x64x128_WarpShape32x64x64
     };
-    
-    return ada_configs;
 }
 
 std::vector<CutlassTileConfig> get_candidate_tiles(
