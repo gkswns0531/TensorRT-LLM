@@ -127,8 +127,9 @@ struct DeviceGemmGatedSm80
         using ActivationFn = Activation<ElementCompute>;
         template<typename TiledMMA>
         struct DualAccumulator {
-            cute::Tensor<typename TiledMMA::ValTypeC> accum;      // Up path
-            cute::Tensor<typename TiledMMA::ValTypeC> accum_gate; // Gate path
+            using FragmentC = decltype(cute::partition_fragment_C(std::declval<TiledMMA>(), cute::make_shape(int{}, int{})));
+            FragmentC accum;      // Up path
+            FragmentC accum_gate; // Gate path
             
             CUTLASS_DEVICE
             DualAccumulator(TiledMMA const& tiled_mma, int tile_m, int tile_n) {

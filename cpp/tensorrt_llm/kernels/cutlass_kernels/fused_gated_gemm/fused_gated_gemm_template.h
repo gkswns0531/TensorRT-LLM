@@ -162,8 +162,29 @@ size_t genericGemmGatedKernelLauncherSm80(void* D, void const* A, void const* B,
     using Gemm = typename DeviceGemmGatedSm80<ElementT, AccumElementType, CTAShape, ClusterShape, 
         MainloopScheduleType, EpilogueScheduleType, TileSchedulerType, Activation, SwapAB>::Gemm;
     
-    typename Gemm::Arguments args = makeGemmGatedArgs<ElementT>(
-        A, B, C_bias, D, m, n, k, scale_d0, scale_d1, scale_output);
+    int const lda = k;
+    int const ldb = n;  // B is transposed for gate GEMM
+    int const ldc = 0;  // C_bias stride (not used for bias)
+    int const ldd = n;
+
+    typename Gemm::Arguments args(
+        cutlass::gemm::GemmUniversalMode::kGemm,  // Mode
+        {m, n, k},                                // Problem size
+        1,                                        // Split-k factor
+        {},                                       // Epilogue args
+        reinterpret_cast<ElementT const*>(A),     // A pointer
+        reinterpret_cast<ElementT const*>(B),     // B pointer  
+        reinterpret_cast<ElementT const*>(C_bias), // C bias pointer
+        reinterpret_cast<ElementT*>(D),           // D pointer
+        0,                                        // batch stride a
+        0,                                        // batch stride b
+        0,                                        // batch stride c
+        0,                                        // batch stride d
+        lda,                                      // stride a
+        ldb,                                      // stride b
+        ldc,                                      // stride c
+        ldd                                       // stride d
+    );
     
     return typedGemmGatedKernelLauncher(Gemm{}, args, D, A, B, C_bias, workspace, workspaceBytes, stream, occupancy);
 }
