@@ -843,13 +843,19 @@ size_t CutlassFusedGatedGemmRunner<T>::dispatchToArch(void* D, void const* A, vo
     }
     else if (mSm == 89 || mSm >= 100)
     {
-        // SM89 (L4) and SM100+ (H100+) use SM80-compatible kernels
+        // SM89 (L4) and SM100+ (B100+) use SM80-compatible kernels
         return dispatch_fused_gated_gemm_to_cutlass_sm80<T>(D, A, B, C_bias, quantOption, m, n, k, scale_d0, scale_d1, scale_output,
             gemmConfig, workspace, workspaceBytes, stream, occupancy);
     }
     else if (mSm >= 80)
     {
         return dispatch_fused_gated_gemm_to_cutlass_sm80<T>(D, A, B, C_bias, quantOption, m, n, k, scale_d0, scale_d1, scale_output,
+            gemmConfig, workspace, workspaceBytes, stream, occupancy);
+    }
+    else if (mSm >= 70 && std::is_same_v<T, half>)
+    {
+        // SM70 (V100) supports FP16 only
+        return dispatchGemmToCutlassSm70FP16<T>(D, A, B, C_bias, quantOption, m, n, k, scale_d0, scale_d1, scale_output,
             gemmConfig, workspace, workspaceBytes, stream, occupancy);
     }
     else
@@ -863,10 +869,36 @@ template <typename T>
 std::vector<tkc::CutlassGemmConfig> CutlassFusedGatedGemmRunner<T>::getConfigs() const
 {
     auto config_type_param = tkc::CutlassGemmConfig::CandidateConfigTypeParam::SIMT_CUTLASS2_GEMM_ACTIVATION;
-    if (mSm < 80)
+    
+    // Architecture support by data type
+    if constexpr (std::is_same_v<T, half>)
+    {
+        if (mSm < 70)
+        {
+            throw std::runtime_error(
+                "[TensorRT-LLM Error][CutlassFusedGatedGemmRunner] FP16 fused gated GEMM requires SM70+ (V100+). Current: SM" + std::to_string(mSm));
+        }
+    }
+    else if constexpr (std::is_same_v<T, __nv_bfloat16>)
+    {
+        if (mSm < 80)
+        {
+            throw std::runtime_error(
+                "[TensorRT-LLM Error][CutlassFusedGatedGemmRunner] BF16 fused gated GEMM requires SM80+ (A100+). Current: SM" + std::to_string(mSm));
+        }
+    }
+    else if constexpr (std::is_same_v<T, __nv_fp8_e4m3>)
+    {
+        if (mSm < 89)
+        {
+            throw std::runtime_error(
+                "[TensorRT-LLM Error][CutlassFusedGatedGemmRunner] FP8 E4M3 fused gated GEMM requires SM89+ (L4+). Current: SM" + std::to_string(mSm));
+        }
+    }
+    else
     {
         throw std::runtime_error(
-            "[TensorRT-LLM Error][CutlassFusedGatedGemmRunner] Arch " + std::to_string(mSm) + " is unsupported for fused gated GEMM");
+            "[TensorRT-LLM Error][CutlassFusedGatedGemmRunner] Unsupported data type for fused gated GEMM");
     }
     
     std::vector<tkc::CutlassGemmConfig> candidateConfigs = get_candidate_configs(mSm, 1, config_type_param);

@@ -23,7 +23,9 @@ namespace kernels
 namespace cutlass_kernels
 {
 
+#ifdef ENABLE_BF16
 template class CutlassFusedGatedGemmRunner<__nv_bfloat16>;
+#endif
 
 } // namespace cutlass_kernels
 } // namespace kernels
