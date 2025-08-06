@@ -56,7 +56,7 @@ endif()
 add_gtest(
   gemmSwigluRunnerTest
   fused_gated_gemm/gemmSwigluRunnerTest.cu
-  ${PROJECT_SOURCE_DIR}/tensorrt_llm/cutlass_extensions/kernels/fused_gated_gemm/gemm_swiglu_e4m3.cu
+  ${PROJECT_SOURCE_DIR}/cpp/tensorrt_llm/kernels/cutlass_kernels/fused_gated_gemm/fused_gated_gemm.cu
   NO_GTEST_MAIN)
 add_gtest(gemmSwigluKernelTestSm90Fp8
           fused_gated_gemm/gemmSwigluKernelTestSm90Fp8.cu NO_GTEST_MAIN

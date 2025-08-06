@@ -163,9 +163,7 @@ list(FILTER ALL_SRCS EXCLUDE REGEX "fp4_gemm/.*")
 list(FILTER ALL_SRCS EXCLUDE REGEX "allreduce_gemm/.*")
 list(FILTER ALL_SRCS EXCLUDE REGEX "low_latency_gemm/.*")
 list(REMOVE_ITEM ALL_SRCS
-     "${CMAKE_CURRENT_SOURCE_DIR}/fused_gated_gemm/fused_gated_gemm_e4m3.cu"
-     "${CMAKE_CURRENT_SOURCE_DIR}/fused_gated_gemm/fused_gated_gemm_fp16.cu"
-     "${CMAKE_CURRENT_SOURCE_DIR}/fused_gated_gemm/fused_gated_gemm_bf16.cu")
+     "${CMAKE_CURRENT_SOURCE_DIR}/fused_gated_gemm/fused_gated_gemm.cu")
 
 message(
   VERBOSE
@@ -194,20 +192,13 @@ set_cuda_architectures(fb_gemm_src 89 90 120f)
 add_library(fp8_blockscale_gemm_src STATIC ${FP8_BLOCKSCALE_GEMM_SRC_CU})
 set_cuda_architectures(fp8_blockscale_gemm_src 89 90 100f)
 
-set(FUSED_GATED_GEMM_E4M3_SRC_CU
-    ${CMAKE_CURRENT_SOURCE_DIR}/fused_gated_gemm/fused_gated_gemm_e4m3.cu)
-add_library(fused_gated_gemm_e4m3_src STATIC ${FUSED_GATED_GEMM_E4M3_SRC_CU})
-set_cuda_architectures(fused_gated_gemm_e4m3_src 89 90 100f)
-
-set(FUSED_GATED_GEMM_FP16_SRC_CU
-    ${CMAKE_CURRENT_SOURCE_DIR}/fused_gated_gemm/fused_gated_gemm_fp16.cu)
-add_library(fused_gated_gemm_fp16_src STATIC ${FUSED_GATED_GEMM_FP16_SRC_CU})
-set_cuda_architectures(fused_gated_gemm_fp16_src 70 80 89 90)
-
-set(FUSED_GATED_GEMM_BF16_SRC_CU
-    ${CMAKE_CURRENT_SOURCE_DIR}/fused_gated_gemm/fused_gated_gemm_bf16.cu)
-add_library(fused_gated_gemm_bf16_src STATIC ${FUSED_GATED_GEMM_BF16_SRC_CU})
-set_cuda_architectures(fused_gated_gemm_bf16_src 80 89 90)
+# Unified fused gated GEMM library supporting all data types (FP16/BF16/FP8)
+# Following Phase 1 unified architecture design
+set(FUSED_GATED_GEMM_SRC_CU
+    ${CMAKE_CURRENT_SOURCE_DIR}/fused_gated_gemm/fused_gated_gemm.cu)
+add_library(fused_gated_gemm_src STATIC ${FUSED_GATED_GEMM_SRC_CU})
+# Support all architectures: SM70 (V100/FP16), SM80 (A100/BF16), SM89 (L4/FP8), SM90 (H100/all), SM100+ (B100+/all)  
+set_cuda_architectures(fused_gated_gemm_src 70 80 89 90 100f)
 
 if(USING_OSS_CUTLASS_LOW_LATENCY_GEMM)
   file(GLOB LOW_LATENCY_GEMM_SRC_CU
@@ -275,7 +266,7 @@ endif()
 set(ALL_KERNELS_LIB cutlass_src)
 
 set(TARGET_LIB
-    fpA_intB_gemm_src;fb_gemm_src;fp8_blockscale_gemm_src;fused_gated_gemm_e4m3_src;fused_gated_gemm_fp16_src;fused_gated_gemm_bf16_src)
+    fpA_intB_gemm_src;fb_gemm_src;fp8_blockscale_gemm_src;fused_gated_gemm_src)
 if(USING_OSS_CUTLASS_LOW_LATENCY_GEMM)
   list(APPEND TARGET_LIB low_latency_gemm_src)
 endif()

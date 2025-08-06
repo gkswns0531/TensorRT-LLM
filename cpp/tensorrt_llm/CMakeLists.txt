@@ -205,9 +205,7 @@ set(TRTLLM_LINK_LIBS
     fpA_intB_gemm_src
     # moe_gemm_src
     fb_gemm_src
-    fused_gated_gemm_e4m3_src
-    fused_gated_gemm_fp16_src
-    fused_gated_gemm_bf16_src
+    fused_gated_gemm_src
     cutlass_src
     layers_src
     runtime_src

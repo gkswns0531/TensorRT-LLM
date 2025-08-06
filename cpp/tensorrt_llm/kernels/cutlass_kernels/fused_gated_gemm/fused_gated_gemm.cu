@@ -22,7 +22,21 @@ namespace kernels
 {
 namespace cutlass_kernels
 {
+
+// Explicit template instantiation for all supported data types
+// Following the unified architecture from Phase 1
+
+// FP16 - Supported on SM70+ (V100+)
+template class CutlassFusedGatedGemmRunner<half>;
+
+// BF16 - Supported on SM80+ (A100+)  
+#ifdef ENABLE_BF16
+template class CutlassFusedGatedGemmRunner<__nv_bfloat16>;
+#endif
+
+// FP8 E4M3 - Supported on SM89+ (L4+)
 template class CutlassFusedGatedGemmRunner<__nv_fp8_e4m3>;
+
 } // namespace cutlass_kernels
 } // namespace kernels
 } // namespace tensorrt_llm

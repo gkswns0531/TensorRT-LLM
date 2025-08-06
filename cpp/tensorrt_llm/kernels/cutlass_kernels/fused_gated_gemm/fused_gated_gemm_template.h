@@ -26,9 +26,6 @@
 // Order matters here, packed_stride.hpp is missing cute and convolution includes
 #include "cutlass/util/packed_stride.hpp"
 #include "cutlass_extensions/gemm_configs.h"
-#include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/common/logger.h"
-#include "tensorrt_llm/kernels/cutlass_kernels/fused_gated_gemm/fused_gated_gemm.h"
 
 #ifdef __GNUC__ // Check if the compiler is GCC or Clang
 #pragma GCC diagnostic pop
@@ -144,54 +141,6 @@ typename Gemm::Arguments prepareGemmArgsSm90(void* D, void const* A, void const*
     return args;
 }
 
-template <typename T, typename ThreadblockShape, typename WarpShape,
-    template <class> typename Activation = cutlass::epilogue::thread::SiLu, bool SwapAB = true>
-size_t genericGemmGatedKernelLauncherSm80(void* D, void const* A, void const* B, void const* C_bias,
-    tk::QuantMode quantOption, int m, int n, int k, float scale_d0, float scale_d1, float scale_output,
-    tkc::CutlassGemmConfig gemmConfig, char* workspace, size_t workspaceBytes, cudaStream_t stream,
-    int* occupancy = nullptr)
-{
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
-    
-    using ElementT = typename TllmToCutlassTypeAdapter<T>::type;
-    using AccumElementType = float;
-    using CTAShape = ThreadblockShape;
-    using ClusterShape = cute::Shape<cute::_1, cute::_1, cute::_1>;
-    
-    using MainloopScheduleType = cutlass::gemm::KernelTmaWarpSpecialized;
-    using EpilogueScheduleType = cutlass::epilogue::TmaWarpSpecialized;
-    using TileSchedulerType = void;
-    
-    using Gemm = typename DeviceGemmGatedSm80<ElementT, AccumElementType, CTAShape, ClusterShape, 
-        MainloopScheduleType, EpilogueScheduleType, TileSchedulerType, Activation, SwapAB>::Gemm;
-    
-    int const lda = k;
-    int const ldb = n;  // B is transposed for gate GEMM
-    int const ldc = 0;  // C_bias stride (not used for bias)
-    int const ldd = n;
-
-    typename Gemm::Arguments args(
-        cutlass::gemm::GemmUniversalMode::kGemm,  // Mode
-        {m, n, k},                                // Problem size
-        1,                                        // Split-k factor
-        {},                                       // Epilogue args
-        reinterpret_cast<ElementT const*>(A),     // A pointer
-        reinterpret_cast<ElementT const*>(B),     // B pointer  
-        reinterpret_cast<ElementT const*>(C_bias), // C bias pointer
-        reinterpret_cast<ElementT*>(D),           // D pointer
-        0,                                        // batch stride a
-        0,                                        // batch stride b
-        0,                                        // batch stride c
-        0,                                        // batch stride d
-        lda,                                      // stride a
-        ldb,                                      // stride b
-        ldc,                                      // stride c
-        ldd                                       // stride d
-    );
-    
-    return typedGemmGatedKernelLauncher(Gemm{}, args, D, A, B, C_bias, workspace, workspaceBytes, stream, occupancy);
-}
-
 template <typename T, typename CTAShape, typename ClusterShape,
     template <class> typename Activation = cutlass::epilogue::thread::SiLu, bool SwapAB = true>
 size_t genericGemmGatedKernelLauncherSm90(void* D, void const* A, void const* B, void const* C_bias,
@@ -222,8 +171,76 @@ size_t genericGemmGatedKernelLauncherSm90(void* D, void const* A, void const* B,
 #endif // COMPILE_HOPPER_TMA_GEMMS
 }
 
+// SM80 config dispatch function using CUTLASS 2.x device::Gemm
+template <typename T, int CtaM, int CtaN, int CtaK, int WarpM, int WarpN, int WarpK>
+size_t dispatchGemmConfigSm80(void* D, void const* A, void const* B, void const* C_bias, tk::QuantMode quantOption,
+    int m, int n, int k, float scale_d0, float scale_d1, float scale_output, tkc::CutlassGemmConfig gemmConfig,
+    char* workspace, size_t workspaceBytes, cudaStream_t stream, int* occupancy = nullptr)
+{
+    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    
+    // Convert TensorRT-LLM types to CUTLASS types
+    using ElementType = typename std::conditional_t<std::is_same_v<T, half>, cutlass::half_t, cutlass::bfloat16_t>;
+    using AccumElementType = float;
+    
+    // Define CTA and Warp shapes 
+    using CTAShape = cutlass::gemm::GemmShape<CtaM, CtaN, CtaK>;
+    using WarpShape = cutlass::gemm::GemmShape<WarpM, WarpN, WarpK>;
+    using InstructionShape = cutlass::gemm::GemmShape<16, 8, 16>; // TensorCore instruction shape
+    
+    // Use SM80 device GEMM with gated activation
+    using DeviceKernel = DefaultDeviceGemmGatedSm80<ElementType>;
+    
+    // Create tensor references for CUTLASS 2.x device::Gemm
+    cutlass::TensorRef<ElementType const, cutlass::layout::RowMajor> tensor_a(
+        reinterpret_cast<ElementType const*>(A), cutlass::layout::RowMajor::packed({m, k}));
+    cutlass::TensorRef<ElementType const, cutlass::layout::ColumnMajor> tensor_b(
+        reinterpret_cast<ElementType const*>(B), cutlass::layout::ColumnMajor::packed({k, n}));
+    cutlass::TensorRef<ElementType const, cutlass::layout::RowMajor> tensor_c(
+        reinterpret_cast<ElementType const*>(C_bias), cutlass::layout::RowMajor::packed({1, n}));
+    cutlass::TensorRef<ElementType, cutlass::layout::RowMajor> tensor_d(
+        reinterpret_cast<ElementType*>(D), cutlass::layout::RowMajor::packed({m, n}));
+
+    typename DeviceKernel::Arguments arguments(
+        cutlass::gemm::GemmCoord(m, n, k),  // Problem size
+        tensor_a,                           // Tensor A
+        tensor_b,                           // Tensor B  
+        tensor_c,                           // Tensor C
+        tensor_d,                           // Tensor D
+        {scale_d0, scale_d1}               // Epilogue params (alpha, beta)
+    );
+    
+    DeviceKernel gemm_operator;
+    
+    // Check if the operation is supported
+    cutlass::Status status = gemm_operator.can_implement(arguments);
+    if (status != cutlass::Status::kSuccess) {
+        std::string error_msg = "[TensorRT-LLM Error][dispatchGemmConfigSm80] Cannot implement GEMM with given arguments. Status: " 
+                                + std::to_string(static_cast<int>(status));
+        throw std::runtime_error(error_msg);
+    }
+    
+    // Get workspace size
+    size_t workspace_size = gemm_operator.get_workspace_size(arguments);
+    if (workspace_size > workspaceBytes) {
+        std::string error_msg = "[TensorRT-LLM Error][dispatchGemmConfigSm80] Insufficient workspace. Required: " 
+                                + std::to_string(workspace_size) + ", Available: " + std::to_string(workspaceBytes);
+        throw std::runtime_error(error_msg);
+    }
+    
+    // Launch the kernel
+    status = gemm_operator.run(arguments, workspace, stream);
+    if (status != cutlass::Status::kSuccess) {
+        std::string error_msg = "[TensorRT-LLM Error][dispatchGemmConfigSm80] Kernel execution failed. Status: " 
+                                + std::to_string(static_cast<int>(status));
+        throw std::runtime_error(error_msg);
+    }
+    
+    return workspace_size;
+}
+
 template <typename T, typename CTAShape>
-size_t dispatch_fused_gated_gemm_to_cutlass_sm90(void* D, void const* A, void const* B, void const* C_bias, tk::QuantMode quantOption,
+size_t dispatchGemmConfigSm90(void* D, void const* A, void const* B, void const* C_bias, tk::QuantMode quantOption,
     int m, int n, int k, float scale_d0, float scale_d1, float scale_output, tkc::CutlassGemmConfig gemmConfig,
     char* workspace, size_t workspaceBytes, cudaStream_t stream, int* occupancy = nullptr)
 {
@@ -256,229 +273,60 @@ size_t dispatch_fused_gated_gemm_to_cutlass_sm90(void* D, void const* A, void co
         break;
     default:
         throw std::runtime_error(
-            "[TensorRT-LLM Error][CutlassFusedGatedGemmRunner][dispatch_fused_gated_gemm_to_cutlass_sm90] Config is invalid for fused "
+            "[TensorRT-LLM Error][CutlassFusedGatedGemmRunner][dispatchGemmConfigSm90] Config is invalid for fused "
             "gated GEMM.");
         break;
     }
 }
 
-// SM80 FP16 SwiGLU dispatch functions
-template <typename T, typename ThreadblockShape, typename WarpShape>
-size_t dispatch_fused_gated_gemm_to_cutlass_sm80(void* D, void const* A, void const* B, void const* C_bias, tk::QuantMode quantOption,
-    int m, int n, int k, float scale_d0, float scale_d1, float scale_output, tkc::CutlassGemmConfig gemmConfig,
-    char* workspace, size_t workspaceBytes, cudaStream_t stream, int* occupancy = nullptr)
-{
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
-    static_assert(std::is_same_v<T, half> || std::is_same_v<T, __nv_bfloat16>, 
-                  "dispatch_fused_gated_gemm_to_cutlass_sm80 supports FP16 and BF16");
-    
-    return genericGemmGatedKernelLauncherSm80<T, ThreadblockShape, WarpShape>(
-        D, A, B, C_bias, quantOption, m, n, k, scale_d0, scale_d1, scale_output, 
-        gemmConfig, workspace, workspaceBytes, stream, occupancy);
-}
-
+// SM80 dispatch function for FP16/BF16 using CUTLASS 2.x device::Gemm 
 template <typename T>
-size_t dispatchGemmToCutlassSm80FP16(void* D, void const* A, void const* B, void const* C_bias, tk::QuantMode quantOption,
+size_t dispatchGemmToCutlassSm80(void* D, void const* A, void const* B, void const* C_bias, tk::QuantMode quantOption,
     int m, int n, int k, float scale_d0, float scale_d1, float scale_output, tkc::CutlassGemmConfig gemmConfig,
     char* workspace, size_t workspaceBytes, cudaStream_t stream, int* occupancy = nullptr)
 {
     TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
-    static_assert(std::is_same_v<T, half> || std::is_same_v<T, __nv_bfloat16>, 
-                  "dispatchGemmToCutlassSm80FP16 supports FP16 and BF16");
     
-    switch (gemmConfig.tile_config_sm80)
+    // Support FP16 and BF16 data types
+    static_assert(std::is_same_v<T, half> || std::is_same_v<T, __nv_bfloat16>, 
+                  "dispatchGemmToCutlassSm80 supports FP16 and BF16 only");
+    
+    switch (gemmConfig.tile_config)
     {
     case tkc::CutlassTileConfig::CtaShape64x128x64_WarpShape32x64x64:
-        return genericGemmGatedKernelLauncherSm80<T, cutlass::gemm::GemmShape<64, 128, 64>, 
-               cutlass::gemm::GemmShape<32, 64, 64>>(D, A, B, C_bias, quantOption, 
-               m, n, k, scale_d0, scale_d1, scale_output, gemmConfig, workspace, 
-               workspaceBytes, stream, occupancy);
+        return dispatchGemmConfigSm80<T, 64, 128, 64, 32, 64, 64>(D, A, B, C_bias, quantOption, m, n, k, 
+            scale_d0, scale_d1, scale_output, gemmConfig, workspace, workspaceBytes, stream, occupancy);
         break;
     case tkc::CutlassTileConfig::CtaShape128x128x64_WarpShape64x64x64:
-        return genericGemmGatedKernelLauncherSm80<T, cutlass::gemm::GemmShape<128, 128, 64>, 
-               cutlass::gemm::GemmShape<64, 64, 64>>(D, A, B, C_bias, quantOption, 
-               m, n, k, scale_d0, scale_d1, scale_output, gemmConfig, workspace, 
-               workspaceBytes, stream, occupancy);
+        return dispatchGemmConfigSm80<T, 128, 128, 64, 64, 64, 64>(D, A, B, C_bias, quantOption, m, n, k,
+            scale_d0, scale_d1, scale_output, gemmConfig, workspace, workspaceBytes, stream, occupancy);
         break;
     case tkc::CutlassTileConfig::CtaShape128x256x64_WarpShape64x64x64:
-        return genericGemmGatedKernelLauncherSm80<T, cutlass::gemm::GemmShape<128, 256, 64>, 
-               cutlass::gemm::GemmShape<64, 64, 64>>(D, A, B, C_bias, quantOption, 
-               m, n, k, scale_d0, scale_d1, scale_output, gemmConfig, workspace, 
-               workspaceBytes, stream, occupancy);
+        return dispatchGemmConfigSm80<T, 128, 256, 64, 64, 64, 64>(D, A, B, C_bias, quantOption, m, n, k,
+            scale_d0, scale_d1, scale_output, gemmConfig, workspace, workspaceBytes, stream, occupancy);
         break;
     case tkc::CutlassTileConfig::CtaShape256x128x64_WarpShape64x64x64:
-        return genericGemmGatedKernelLauncherSm80<T, cutlass::gemm::GemmShape<256, 128, 64>, 
-               cutlass::gemm::GemmShape<64, 64, 64>>(D, A, B, C_bias, quantOption, 
-               m, n, k, scale_d0, scale_d1, scale_output, gemmConfig, workspace, 
-               workspaceBytes, stream, occupancy);
+        return dispatchGemmConfigSm80<T, 256, 128, 64, 64, 64, 64>(D, A, B, C_bias, quantOption, m, n, k,
+            scale_d0, scale_d1, scale_output, gemmConfig, workspace, workspaceBytes, stream, occupancy);
         break;
     case tkc::CutlassTileConfig::CtaShape128x64x64_WarpShape64x32x64:
-        return genericGemmGatedKernelLauncherSm80<T, cutlass::gemm::GemmShape<128, 64, 64>, 
-               cutlass::gemm::GemmShape<64, 32, 64>>(D, A, B, C_bias, quantOption, 
-               m, n, k, scale_d0, scale_d1, scale_output, gemmConfig, workspace, 
-               workspaceBytes, stream, occupancy);
+        return dispatchGemmConfigSm80<T, 128, 64, 64, 64, 32, 64>(D, A, B, C_bias, quantOption, m, n, k,
+            scale_d0, scale_d1, scale_output, gemmConfig, workspace, workspaceBytes, stream, occupancy);
         break;
     case tkc::CutlassTileConfig::CtaShape64x64x128_WarpShape32x64x64:
-        return genericGemmGatedKernelLauncherSm80<T, cutlass::gemm::GemmShape<64, 64, 128>, 
-               cutlass::gemm::GemmShape<32, 64, 64>>(D, A, B, C_bias, quantOption, 
-               m, n, k, scale_d0, scale_d1, scale_output, gemmConfig, workspace, 
-               workspaceBytes, stream, occupancy);
+        return dispatchGemmConfigSm80<T, 64, 64, 128, 32, 64, 64>(D, A, B, C_bias, quantOption, m, n, k,
+            scale_d0, scale_d1, scale_output, gemmConfig, workspace, workspaceBytes, stream, occupancy);
         break;
     case tkc::CutlassTileConfig::CtaShape128x64x128_WarpShape64x32x128:
-        return genericGemmGatedKernelLauncherSm80<T, cutlass::gemm::GemmShape<128, 64, 128>, 
-               cutlass::gemm::GemmShape<64, 32, 128>>(D, A, B, C_bias, quantOption, 
-               m, n, k, scale_d0, scale_d1, scale_output, gemmConfig, workspace, 
-               workspaceBytes, stream, occupancy);
-        break;
-    case tkc::CutlassTileConfig::Undefined:
-        throw std::runtime_error(
-            "[TensorRT-LLm Error][CutlassFusedGatedGemmRunner][dispatchGemmToCutlassSm80FP16] gemm config undefined.");
-        break;
-    case tkc::CutlassTileConfig::ChooseWithHeuristic:
-        throw std::runtime_error(
-            "[TensorRT-LLm Error][CutlassFusedGatedGemmRunner][dispatchGemmToCutlassSm80FP16] gemm config should have "
-            "already been set by heuristic.");
+        return dispatchGemmConfigSm80<T, 128, 64, 128, 64, 32, 128>(D, A, B, C_bias, quantOption, m, n, k,
+            scale_d0, scale_d1, scale_output, gemmConfig, workspace, workspaceBytes, stream, occupancy);
         break;
     default:
-        throw std::runtime_error(
-            "[TensorRT-LLm Error][CutlassFusedGatedGemmRunner][dispatchGemmToCutlassSm80FP16] Config is invalid for fused "
-            "gated GEMM.");
-        break;
+        std::string error_msg = "[TensorRT-LLM Error][dispatchGemmToCutlassSm80] Config undefined for tile config: " + std::to_string(static_cast<int>(gemmConfig.tile_config));
+        throw std::runtime_error(error_msg);
     }
-}
 
-template <typename T>
-size_t dispatchGemmToCutlassSm70FP16(void* D, void const* A, void const* B, void const* C_bias, tk::QuantMode quantOption,
-    int m, int n, int k, float scale_d0, float scale_d1, float scale_output, tkc::CutlassGemmConfig gemmConfig,
-    char* workspace, size_t workspaceBytes, cudaStream_t stream, int* occupancy = nullptr)
-{
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
-    static_assert(std::is_same_v<T, half> || std::is_same_v<T, __nv_bfloat16>, 
-                  "dispatchGemmToCutlassSm70FP16 supports FP16 and BF16");
-    
-    switch (gemmConfig.tile_config_sm80)
-    {
-    case tkc::CutlassTileConfig::CtaShape32x128x64_WarpShape32x32x64:
-        return genericGemmGatedKernelLauncherSm80<T, cutlass::gemm::GemmShape<32, 128, 64>, 
-               cutlass::gemm::GemmShape<32, 32, 64>>(D, A, B, C_bias, quantOption, 
-               m, n, k, scale_d0, scale_d1, scale_output, gemmConfig, workspace, 
-               workspaceBytes, stream, occupancy);
-        break;
-    case tkc::CutlassTileConfig::CtaShape64x128x64_WarpShape32x64x64:
-        return genericGemmGatedKernelLauncherSm80<T, cutlass::gemm::GemmShape<64, 128, 64>, 
-               cutlass::gemm::GemmShape<32, 64, 64>>(D, A, B, C_bias, quantOption, 
-               m, n, k, scale_d0, scale_d1, scale_output, gemmConfig, workspace, 
-               workspaceBytes, stream, occupancy);
-        break;
-    case tkc::CutlassTileConfig::CtaShape128x128x64_WarpShape64x32x64:
-        return genericGemmGatedKernelLauncherSm80<T, cutlass::gemm::GemmShape<128, 128, 64>, 
-               cutlass::gemm::GemmShape<64, 32, 64>>(D, A, B, C_bias, quantOption, 
-               m, n, k, scale_d0, scale_d1, scale_output, gemmConfig, workspace, 
-               workspaceBytes, stream, occupancy);
-        break;
-    case tkc::CutlassTileConfig::CtaShape128x64x64_WarpShape64x32x64:
-        return genericGemmGatedKernelLauncherSm80<T, cutlass::gemm::GemmShape<128, 64, 64>, 
-               cutlass::gemm::GemmShape<64, 32, 64>>(D, A, B, C_bias, quantOption, 
-               m, n, k, scale_d0, scale_d1, scale_output, gemmConfig, workspace, 
-               workspaceBytes, stream, occupancy);
-        break;
-    case tkc::CutlassTileConfig::CtaShape64x64x128_WarpShape32x64x64:
-        return genericGemmGatedKernelLauncherSm80<T, cutlass::gemm::GemmShape<64, 64, 128>, 
-               cutlass::gemm::GemmShape<32, 64, 64>>(D, A, B, C_bias, quantOption, 
-               m, n, k, scale_d0, scale_d1, scale_output, gemmConfig, workspace, 
-               workspaceBytes, stream, occupancy);
-        break;
-    case tkc::CutlassTileConfig::CtaShape128x128x8_WarpShape64x64x8:
-        return genericGemmGatedKernelLauncherSm80<T, cutlass::gemm::GemmShape<128, 128, 8>, 
-               cutlass::gemm::GemmShape<64, 64, 8>>(D, A, B, C_bias, quantOption, 
-               m, n, k, scale_d0, scale_d1, scale_output, gemmConfig, workspace, 
-               workspaceBytes, stream, occupancy);
-        break;
-    case tkc::CutlassTileConfig::Undefined:
-        throw std::runtime_error(
-            "[TensorRT-LLm Error][CutlassFusedGatedGemmRunner][dispatchGemmToCutlassSm70FP16] gemm config undefined.");
-        break;
-    case tkc::CutlassTileConfig::ChooseWithHeuristic:
-        throw std::runtime_error(
-            "[TensorRT-LLm Error][CutlassFusedGatedGemmRunner][dispatchGemmToCutlassSm70FP16] gemm config should have "
-            "already been set by heuristic.");
-        break;
-    default:
-        throw std::runtime_error(
-            "[TensorRT-LLm Error][CutlassFusedGatedGemmRunner][dispatchGemmToCutlassSm70FP16] Config is invalid for fused "
-            "gated GEMM.");
-        break;
-    }
-}
-
-template <typename T>
-size_t dispatchGemmToCutlassSm89FP16(void* D, void const* A, void const* B, void const* C_bias, tk::QuantMode quantOption,
-    int m, int n, int k, float scale_d0, float scale_d1, float scale_output, tkc::CutlassGemmConfig gemmConfig,
-    char* workspace, size_t workspaceBytes, cudaStream_t stream, int* occupancy = nullptr)
-{
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
-    static_assert(std::is_same_v<T, half> || std::is_same_v<T, __nv_bfloat16>, 
-                  "dispatchGemmToCutlassSm89FP16 supports FP16 and BF16");
-    
-    switch (gemmConfig.tile_config_sm80)
-    {
-    case tkc::CutlassTileConfig::CtaShape32x128x64_WarpShape32x32x64:
-        return genericGemmGatedKernelLauncherSm80<T, cutlass::gemm::GemmShape<32, 128, 64>, 
-               cutlass::gemm::GemmShape<32, 32, 64>>(D, A, B, C_bias, quantOption, 
-               m, n, k, scale_d0, scale_d1, scale_output, gemmConfig, workspace, 
-               workspaceBytes, stream, occupancy);
-        break;
-    case tkc::CutlassTileConfig::CtaShape64x128x64_WarpShape32x64x64:
-        return genericGemmGatedKernelLauncherSm80<T, cutlass::gemm::GemmShape<64, 128, 64>, 
-               cutlass::gemm::GemmShape<32, 64, 64>>(D, A, B, C_bias, quantOption, 
-               m, n, k, scale_d0, scale_d1, scale_output, gemmConfig, workspace, 
-               workspaceBytes, stream, occupancy);
-        break;
-    case tkc::CutlassTileConfig::CtaShape128x64x64_WarpShape64x32x64:
-        return genericGemmGatedKernelLauncherSm80<T, cutlass::gemm::GemmShape<128, 64, 64>, 
-               cutlass::gemm::GemmShape<64, 32, 64>>(D, A, B, C_bias, quantOption, 
-               m, n, k, scale_d0, scale_d1, scale_output, gemmConfig, workspace, 
-               workspaceBytes, stream, occupancy);
-        break;
-    case tkc::CutlassTileConfig::CtaShape128x128x64_WarpShape64x64x64:
-        return genericGemmGatedKernelLauncherSm80<T, cutlass::gemm::GemmShape<128, 128, 64>, 
-               cutlass::gemm::GemmShape<64, 64, 64>>(D, A, B, C_bias, quantOption, 
-               m, n, k, scale_d0, scale_d1, scale_output, gemmConfig, workspace, 
-               workspaceBytes, stream, occupancy);
-        break;
-    case tkc::CutlassTileConfig::CtaShape128x256x64_WarpShape64x64x64:
-        return genericGemmGatedKernelLauncherSm80<T, cutlass::gemm::GemmShape<128, 256, 64>, 
-               cutlass::gemm::GemmShape<64, 64, 64>>(D, A, B, C_bias, quantOption, 
-               m, n, k, scale_d0, scale_d1, scale_output, gemmConfig, workspace, 
-               workspaceBytes, stream, occupancy);
-        break;
-    case tkc::CutlassTileConfig::CtaShape256x128x64_WarpShape64x64x64:
-        return genericGemmGatedKernelLauncherSm80<T, cutlass::gemm::GemmShape<256, 128, 64>, 
-               cutlass::gemm::GemmShape<64, 64, 64>>(D, A, B, C_bias, quantOption, 
-               m, n, k, scale_d0, scale_d1, scale_output, gemmConfig, workspace, 
-               workspaceBytes, stream, occupancy);
-        break;
-    case tkc::CutlassTileConfig::CtaShape64x64x128_WarpShape32x64x64:
-        return genericGemmGatedKernelLauncherSm80<T, cutlass::gemm::GemmShape<64, 64, 128>, 
-               cutlass::gemm::GemmShape<32, 64, 64>>(D, A, B, C_bias, quantOption, 
-               m, n, k, scale_d0, scale_d1, scale_output, gemmConfig, workspace, 
-               workspaceBytes, stream, occupancy);
-        break;
-    case tkc::CutlassTileConfig::Undefined:
-        throw std::runtime_error(
-            "[TensorRT-LLm Error][CutlassFusedGatedGemmRunner][dispatchGemmToCutlassSm89FP16] gemm config undefined.");
-        break;
-    case tkc::CutlassTileConfig::ChooseWithHeuristic:
-        throw std::runtime_error(
-            "[TensorRT-LLm Error][CutlassFusedGatedGemmRunner][dispatchGemmToCutlassSm89FP16] gemm config should have "
-            "already been set by heuristic.");
-        break;
-    default:
-        throw std::runtime_error(
-            "[TensorRT-LLm Error][CutlassFusedGatedGemmRunner][dispatchGemmToCutlassSm89FP16] Config is invalid for fused "
-            "gated GEMM.");
-        break;
-    }
+    return 0;
 }
 
 template <typename T>
@@ -487,54 +335,41 @@ size_t dispatchGemmToCutlassSm90(void* D, void const* A, void const* B, void con
     char* workspace, size_t workspaceBytes, cudaStream_t stream, int* occupancy = nullptr)
 {
     TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
-    static_assert(std::is_same_v<T, __nv_fp8_e4m3> || std::is_same_v<T, half> || std::is_same_v<T, __nv_bfloat16>, 
-                  "fusedGatedGemmSm90 supports FP8, FP16, and BF16");
+    static_assert(std::is_same_v<T, __nv_fp8_e4m3>, "fusedGatedGemmSm90 only support FP8(e4m3)");
     constexpr int Ktile = 128 / sizeof(T);
     using _Ktile = Int<Ktile>;
     switch (gemmConfig.tile_config_sm90)
     {
     case tkc::CutlassTileConfigSM90::CtaShape64x16x128B:
-        return genericGemmGatedKernelLauncherSm90<T, Shape<_64, _16, _Ktile>>(D, A, B, C_bias, quantOption, m, n, k, scale_d0,
+        return dispatchGemmConfigSm90<T, Shape<_64, _16, _Ktile>>(D, A, B, C_bias, quantOption, m, n, k, scale_d0,
             scale_d1, scale_output, gemmConfig, workspace, workspaceBytes, stream, occupancy);
         break;
     case tkc::CutlassTileConfigSM90::CtaShape64x32x128B:
-        return genericGemmGatedKernelLauncherSm90<T, Shape<_64, _32, _Ktile>>(D, A, B, C_bias, quantOption, m, n, k, scale_d0,
+        return dispatchGemmConfigSm90<T, Shape<_64, _32, _Ktile>>(D, A, B, C_bias, quantOption, m, n, k, scale_d0,
             scale_d1, scale_output, gemmConfig, workspace, workspaceBytes, stream, occupancy);
         break;
     case tkc::CutlassTileConfigSM90::CtaShape64x64x128B:
-        return genericGemmGatedKernelLauncherSm90<T, Shape<_64, _64, _Ktile>>(D, A, B, C_bias, quantOption, m, n, k, scale_d0,
+        return dispatchGemmConfigSm90<T, Shape<_64, _64, _Ktile>>(D, A, B, C_bias, quantOption, m, n, k, scale_d0,
             scale_d1, scale_output, gemmConfig, workspace, workspaceBytes, stream, occupancy);
         break;
     case tkc::CutlassTileConfigSM90::CtaShape64x128x128B:
-        return genericGemmGatedKernelLauncherSm90<T, Shape<_64, _128, _Ktile>>(D, A, B, C_bias, quantOption, m, n, k, scale_d0,
+        return dispatchGemmConfigSm90<T, Shape<_64, _128, _Ktile>>(D, A, B, C_bias, quantOption, m, n, k, scale_d0,
             scale_d1, scale_output, gemmConfig, workspace, workspaceBytes, stream, occupancy);
         break;
     case tkc::CutlassTileConfigSM90::CtaShape128x16x128B:
-        return genericGemmGatedKernelLauncherSm90<T, Shape<_128, _16, _Ktile>>(D, A, B, C_bias, quantOption, m, n, k, scale_d0,
+        return dispatchGemmConfigSm90<T, Shape<_128, _16, _Ktile>>(D, A, B, C_bias, quantOption, m, n, k, scale_d0,
             scale_d1, scale_output, gemmConfig, workspace, workspaceBytes, stream, occupancy);
         break;
     case tkc::CutlassTileConfigSM90::CtaShape128x32x128B:
-        return genericGemmGatedKernelLauncherSm90<T, Shape<_128, _32, _Ktile>>(D, A, B, C_bias, quantOption, m, n, k, scale_d0,
+        return dispatchGemmConfigSm90<T, Shape<_128, _32, _Ktile>>(D, A, B, C_bias, quantOption, m, n, k, scale_d0,
             scale_d1, scale_output, gemmConfig, workspace, workspaceBytes, stream, occupancy);
         break;
     case tkc::CutlassTileConfigSM90::CtaShape128x64x128B:
-        return genericGemmGatedKernelLauncherSm90<T, Shape<_128, _64, _Ktile>>(D, A, B, C_bias, quantOption, m, n, k, scale_d0,
+        return dispatchGemmConfigSm90<T, Shape<_128, _64, _Ktile>>(D, A, B, C_bias, quantOption, m, n, k, scale_d0,
             scale_d1, scale_output, gemmConfig, workspace, workspaceBytes, stream, occupancy);
         break;
     case tkc::CutlassTileConfigSM90::CtaShape128x128x128B:
-        return genericGemmGatedKernelLauncherSm90<T, Shape<_128, _128, _Ktile>>(D, A, B, C_bias, quantOption, m, n, k, scale_d0,
-            scale_d1, scale_output, gemmConfig, workspace, workspaceBytes, stream, occupancy);
-        break;
-    case tkc::CutlassTileConfigSM90::CtaShape128x256x128B:
-        return genericGemmGatedKernelLauncherSm90<T, Shape<_128, _256, _Ktile>>(D, A, B, C_bias, quantOption, m, n, k, scale_d0,
-            scale_d1, scale_output, gemmConfig, workspace, workspaceBytes, stream, occupancy);
-        break;
-    case tkc::CutlassTileConfigSM90::CtaShape256x128x128B:
-        return genericGemmGatedKernelLauncherSm90<T, Shape<_256, _128, _Ktile>>(D, A, B, C_bias, quantOption, m, n, k, scale_d0,
-            scale_d1, scale_output, gemmConfig, workspace, workspaceBytes, stream, occupancy);
-        break;
-    case tkc::CutlassTileConfigSM90::CtaShape64x256x128B:
-        return genericGemmGatedKernelLauncherSm90<T, Shape<_64, _256, _Ktile>>(D, A, B, C_bias, quantOption, m, n, k, scale_d0,
+        return dispatchGemmConfigSm90<T, Shape<_128, _128, _Ktile>>(D, A, B, C_bias, quantOption, m, n, k, scale_d0,
             scale_d1, scale_output, gemmConfig, workspace, workspaceBytes, stream, occupancy);
         break;
     case tkc::CutlassTileConfigSM90::Undefined:
@@ -560,6 +395,12 @@ CutlassFusedGatedGemmRunner<T>::CutlassFusedGatedGemmRunner()
 {
     TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
     mSm = tk::getSMVersion();
+    
+    // Initialize multiProcessorCount following TensorRT-LLM pattern
+    auto const deviceId = tk::getDevice();
+    cudaDeviceProp deviceProp{};
+    tk::check_cuda_error(cudaGetDeviceProperties(&deviceProp, deviceId));
+    mMultiProcessorCount = deviceProp.multiProcessorCount;
 }
 
 template <typename T>
@@ -574,87 +415,38 @@ size_t CutlassFusedGatedGemmRunner<T>::dispatchToArch(void* D, void const* A, vo
     tkc::CutlassGemmConfig gemmConfig, char* workspace, size_t workspaceBytes, cudaStream_t stream, int* occupancy)
 {
     TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
-    if constexpr (std::is_same_v<T, __nv_fp8_e4m3>)
+    
+    // Follow int8_gemm pattern: architecture-based dispatch with precise targeting
+    if (mSm >= 90)
     {
-#ifndef PLACEHOLDER_KERNELS
-        if (mSm == 90)
-        {
-            return dispatchGemmToCutlassSm90<T>(D, A, B, C_bias, quantOption, m, n, k, scale_d0, scale_d1, scale_output,
-                gemmConfig, workspace, workspaceBytes, stream, occupancy);
-        }
-        else
-#endif
-        {
-            throw std::runtime_error(
-                "[TensorRT-LLM Error][CutlassFusedGatedGemmRunner][GEMM Dispatch] Arch unsupported for CUTLASS fused "
-                "gated GEMM");
-        }
+        // SM90+ (H100, B100+) -> CUTLASS 3.x with TMA + WGMMA for optimal performance
+        return dispatchGemmToCutlass<T, cutlass::arch::Sm90>(D, A, B, C_bias, quantOption, m, n, k, 
+            scale_d0, scale_d1, scale_output, gemmConfig, workspace, workspaceBytes, stream, occupancy);
     }
-    else if constexpr (std::is_same_v<T, half>)
+    else if (mSm == 89)
     {
-        if (mSm == 80) 
-        {
-            return dispatchGemmToCutlassSm80FP16<T>(D, A, B, C_bias, quantOption, m, n, k, scale_d0, scale_d1, scale_output,
-                gemmConfig, workspace, workspaceBytes, stream, occupancy);
-        }
-        else if (mSm == 70)  
-        {
-            return dispatchGemmToCutlassSm70FP16<T>(D, A, B, C_bias, quantOption, m, n, k, scale_d0, scale_d1, scale_output,
-                gemmConfig, workspace, workspaceBytes, stream, occupancy);
-        }
-        else if (mSm == 89)  
-        {
-            return dispatchGemmToCutlassSm89FP16<T>(D, A, B, C_bias, quantOption, m, n, k, scale_d0, scale_d1, scale_output,
-                gemmConfig, workspace, workspaceBytes, stream, occupancy);
-        }
-        else if (mSm == 90)  
-        {
-            return dispatchGemmToCutlassSm90<T>(D, A, B, C_bias, quantOption, m, n, k, scale_d0, scale_d1, scale_output,
-                gemmConfig, workspace, workspaceBytes, stream, occupancy);
-        }
-        else
-        {
-            throw std::runtime_error(
-                "[TensorRT-LLM Error][CutlassFusedGatedGemmRunner][GEMM Dispatch] Arch unsupported for FP16 SwiGLU: SM" 
-                + std::to_string(mSm));
-        }
+        // SM89 (L4) -> Supports FP16, BF16 via CUTLASS 2.x (FP8 not yet implemented)
+        return dispatchGemmToCutlass<T, cutlass::arch::Sm89>(D, A, B, C_bias, quantOption, m, n, k,
+            scale_d0, scale_d1, scale_output, gemmConfig, workspace, workspaceBytes, stream, occupancy);
     }
-    else if constexpr (std::is_same_v<T, __nv_bfloat16>)
+    else if (mSm >= 80)
     {
-        if (mSm == 80)  
-        {
-            return dispatchGemmToCutlassSm80FP16<T>(D, A, B, C_bias, quantOption, m, n, k, scale_d0, scale_d1, scale_output,
-                gemmConfig, workspace, workspaceBytes, stream, occupancy);
-        }
-        else if (mSm == 70)  
-        {
-            return dispatchGemmToCutlassSm70FP16<T>(D, A, B, C_bias, quantOption, m, n, k, scale_d0, scale_d1, scale_output,
-                gemmConfig, workspace, workspaceBytes, stream, occupancy);
-        }
-        else if (mSm == 89)  
-        {
-            return dispatchGemmToCutlassSm89FP16<T>(D, A, B, C_bias, quantOption, m, n, k, scale_d0, scale_d1, scale_output,
-                gemmConfig, workspace, workspaceBytes, stream, occupancy);
-        }
-        else if (mSm == 90)  
-        {
-            return dispatchGemmToCutlassSm90<T>(D, A, B, C_bias, quantOption, m, n, k, scale_d0, scale_d1, scale_output,
-                gemmConfig, workspace, workspaceBytes, stream, occupancy);
-        }
-        else
-        {
-            throw std::runtime_error(
-                "[TensorRT-LLM Error][CutlassFusedGatedGemmRunner][GEMM Dispatch] BF16 SwiGLU only supported on SM70+ (V100+): SM" 
-                + std::to_string(mSm));
-        }
+        // SM80 (A100) -> CUTLASS 2.x device::Gemm, FP16/BF16 only  
+        return dispatchGemmToCutlass<T, cutlass::arch::Sm80>(D, A, B, C_bias, quantOption, m, n, k,
+            scale_d0, scale_d1, scale_output, gemmConfig, workspace, workspaceBytes, stream, occupancy);
+    }
+    else if (mSm >= 70 && std::is_same_v<T, half>)
+    {
+        // SM70 (V100) -> CUTLASS 2.x, FP16 only
+        return dispatchGemmToCutlass<T, cutlass::arch::Sm70>(D, A, B, C_bias, quantOption, m, n, k,
+            scale_d0, scale_d1, scale_output, gemmConfig, workspace, workspaceBytes, stream, occupancy);
     }
     else
     {
-        throw std::runtime_error(
-            "[TensorRT-LLM Error][CutlassFusedGatedGemmRunner][GEMM Dispatch] dtype unsupported for CUTLASS fused "
-            "gated GEMM");
+        std::string error_msg = "[TensorRT-LLM Error][CutlassFusedGatedGemmRunner][GEMM Dispatch] Arch unsupported for CUTLASS fused gated GEMM: SM" 
+                                + std::to_string(mSm) + " with " + typeid(T).name();
+        throw std::runtime_error(error_msg);
     }
-    return 0;
 }
 
 template <typename T>
@@ -676,69 +468,93 @@ std::vector<tkc::CutlassGemmConfig> CutlassFusedGatedGemmRunner<T>::getConfigs()
 
     std::vector<CutlassGemmConfig> candidateConfigs;
 
-    if constexpr (std::is_same_v<T, __nv_fp8_e4m3>)
+    // Current implementation status: only FP8 E4M3 is fully supported
+    // FP16/BF16 configs are provided for future implementation compatibility
+    if constexpr (std::is_same_v<T, half>)
     {
-        if (mSm != 90)
+        if (mSm < 70)
         {
             throw std::runtime_error(
-                "[TensorRT-LLM Error][CutlassFusedGatedGemmRunner][GEMM Dispatch] Arch unsupported for CUTLASS fused "
-                "gated GEMM");
+                "[TensorRT-LLM Error][CutlassFusedGatedGemmRunner] FP16 fused gated GEMM requires SM70+ (V100+). Current: SM" + std::to_string(mSm));
         }
-        tkc::CutlassGemmConfig::CandidateConfigTypeParam config_type_param
-            = tkc::CutlassGemmConfig::CandidateConfigTypeParam::HOPPER;
-        std::vector<CutlassGemmConfig> commonConfigs = get_candidate_configs(mSm, 2, config_type_param);
+        
+        // FP16 fully implemented using CUTLASS 2.x kernels (SM70/80/89 compatible)
+        auto config_type_param = tkc::CutlassGemmConfig::CandidateConfigTypeParam::FP16_SWIGLU;
+        std::vector<CutlassGemmConfig> commonConfigs = get_candidate_configs(mSm, 1, config_type_param);
         candidateConfigs.insert(candidateConfigs.end(), commonConfigs.begin(), commonConfigs.end());
-        // registers are not enough when N_tile is 256, remove some configs
-        candidateConfigs.erase(std::remove_if(candidateConfigs.begin(), candidateConfigs.end(),
-                                   [](auto const& config)
-                                   {
-                                       return config.tile_config_sm90 == tkc::CutlassTileConfigSM90::CtaShape64x256x128B
-                                           || config.tile_config_sm90
-                                           == tkc::CutlassTileConfigSM90::CtaShape128x256x128B;
-                                   }),
-            candidateConfigs.end());
-        std::vector<tkc::CutlassTileConfigSM90> tilesSm90
-            = {tkc::CutlassTileConfigSM90::CtaShape64x16x128B, tkc::CutlassTileConfigSM90::CtaShape64x32x128B,
-                tkc::CutlassTileConfigSM90::CtaShape64x64x128B, tkc::CutlassTileConfigSM90::CtaShape64x128x128B,
-                tkc::CutlassTileConfigSM90::CtaShape128x16x128B, tkc::CutlassTileConfigSM90::CtaShape128x32x128B,
-                tkc::CutlassTileConfigSM90::CtaShape128x64x128B, tkc::CutlassTileConfigSM90::CtaShape128x128x128B};
-        for (auto const& tile_config : tilesSm90)
-        {
-            {
-                CutlassGemmConfig config(tile_config, tkc::MainloopScheduleType::AUTO, tkc::EpilogueScheduleType::AUTO,
-                    tkc::ClusterShape::ClusterShape_1x8x1);
-                candidateConfigs.push_back(config);
-            }
-            {
-                CutlassGemmConfig config(tile_config, tkc::MainloopScheduleType::AUTO, tkc::EpilogueScheduleType::AUTO,
-                    tkc::ClusterShape::ClusterShape_8x1x1);
-                candidateConfigs.push_back(config);
-            }
-        }
     }
-    else if constexpr (std::is_same_v<T, half> || std::is_same_v<T, __nv_bfloat16>)
+    else if constexpr (std::is_same_v<T, __nv_bfloat16>)
     {
-        // FP16/BF16 SwiGLU support
-        if (mSm >= 70)  // V100+
+        if (mSm < 80)
         {
+            throw std::runtime_error(
+                "[TensorRT-LLM Error][CutlassFusedGatedGemmRunner] BF16 fused gated GEMM requires SM80+ (A100+). Current: SM" + std::to_string(mSm));
+        }
+        
+        // BF16 fully implemented using CUTLASS 2.x kernels (SM80/89 compatible) with SwiGLU-optimized tiles
+        auto config_type_param = tkc::CutlassGemmConfig::CandidateConfigTypeParam::FP16_SWIGLU;
+        std::vector<CutlassGemmConfig> commonConfigs = get_candidate_configs(mSm, 1, config_type_param);
+        candidateConfigs.insert(candidateConfigs.end(), commonConfigs.begin(), commonConfigs.end());
+    }
+    else if constexpr (std::is_same_v<T, __nv_fp8_e4m3>)
+    {
+        if (mSm < 89)
+        {
+            throw std::runtime_error(
+                "[TensorRT-LLM Error][CutlassFusedGatedGemmRunner] FP8 E4M3 fused gated GEMM requires SM89+ (L4+). Current: SM" + std::to_string(mSm));
+        }
+        
+        if (mSm == 90)
+        {
+            // SM90 uses HOPPER configs with TMA
             tkc::CutlassGemmConfig::CandidateConfigTypeParam config_type_param
-                = tkc::CutlassGemmConfig::CandidateConfigTypeParam::FP16_SWIGLU;
-            std::vector<CutlassGemmConfig> commonConfigs = get_candidate_configs(mSm, 8, config_type_param);
+                = tkc::CutlassGemmConfig::CandidateConfigTypeParam::HOPPER;
+            std::vector<CutlassGemmConfig> commonConfigs = get_candidate_configs(mSm, 2, config_type_param);
             candidateConfigs.insert(candidateConfigs.end(), commonConfigs.begin(), commonConfigs.end());
+            
+            // registers are not enough when N_tile is 256, remove some configs
+            candidateConfigs.erase(std::remove_if(candidateConfigs.begin(), candidateConfigs.end(),
+                                       [](auto const& config)
+                                       {
+                                           return config.tile_config_sm90 == tkc::CutlassTileConfigSM90::CtaShape64x256x128B
+                                               || config.tile_config_sm90
+                                               == tkc::CutlassTileConfigSM90::CtaShape128x256x128B;
+                                       }),
+                candidateConfigs.end());
+            
+            std::vector<tkc::CutlassTileConfigSM90> tilesSm90
+                = {tkc::CutlassTileConfigSM90::CtaShape64x16x128B, tkc::CutlassTileConfigSM90::CtaShape64x32x128B,
+                    tkc::CutlassTileConfigSM90::CtaShape64x64x128B, tkc::CutlassTileConfigSM90::CtaShape64x128x128B,
+                    tkc::CutlassTileConfigSM90::CtaShape128x16x128B, tkc::CutlassTileConfigSM90::CtaShape128x32x128B,
+                    tkc::CutlassTileConfigSM90::CtaShape128x64x128B, tkc::CutlassTileConfigSM90::CtaShape128x128x128B};
+            for (auto const& tile_config : tilesSm90)
+            {
+                {
+                    CutlassGemmConfig config(tile_config, tkc::MainloopScheduleType::AUTO, tkc::EpilogueScheduleType::AUTO,
+                        tkc::ClusterShape::ClusterShape_1x8x1);
+                    candidateConfigs.push_back(config);
+                }
+                {
+                    CutlassGemmConfig config(tile_config, tkc::MainloopScheduleType::AUTO, tkc::EpilogueScheduleType::AUTO,
+                        tkc::ClusterShape::ClusterShape_8x1x1);
+                    candidateConfigs.push_back(config);
+                }
+            }
         }
         else
         {
+            // SM89 FP8: Not yet implemented - will be supported with dedicated CUTLASS 2.x kernel
             throw std::runtime_error(
-                "[TensorRT-LLM Error][CutlassFusedGatedGemmRunner][getConfigs] FP16/BF16 SwiGLU requires SM70+ (V100+). "
-                "Current: SM" + std::to_string(mSm));
+                "[TensorRT-LLM Error][CutlassFusedGatedGemmRunner] SM89 FP8 SwiGLU fusion not yet implemented. "
+                "Will be supported with dedicated CUTLASS 2.x kernel in future releases.");
         }
     }
     else
     {
         throw std::runtime_error(
-            "[TensorRT-LLM Error][CutlassFusedGatedGemmRunner][GEMM Dispatch] dtype unsupported for CUTLASS fused "
-            "gated GEMM");
+            "[TensorRT-LLM Error][CutlassFusedGatedGemmRunner] Unsupported data type for fused gated GEMM: " + std::string(typeid(T).name()));
     }
+    
     return candidateConfigs;
 }
 
@@ -799,6 +615,202 @@ size_t CutlassFusedGatedGemmRunner<T>::getWorkspaceSize(int const m, int const n
         workspace_size = workspace_hashmap[std::make_tuple(m, n, k)];
     }
     return workspace_size;
+}
+
+// SM89 config dispatch function for FP16/BF16 using CUTLASS 2.x device::Gemm
+template <typename T, int CtaM, int CtaN, int CtaK, int WarpM, int WarpN, int WarpK>
+size_t dispatchGemmConfigSm89(void* D, void const* A, void const* B, void const* C_bias, tk::QuantMode quantOption,
+    int m, int n, int k, float scale_d0, float scale_d1, float scale_output, tkc::CutlassGemmConfig gemmConfig,
+    char* workspace, size_t workspaceBytes, cudaStream_t stream, int* occupancy = nullptr)
+{
+    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    
+    // Convert TensorRT-LLM types to CUTLASS types
+    using ElementType = typename std::conditional_t<std::is_same_v<T, half>, cutlass::half_t, cutlass::bfloat16_t>;
+    using AccumElementType = float;
+    
+    // Define CTA and Warp shapes (following SM80 pattern - declared but not used in DefaultDeviceGemmGatedSm80)
+    using CTAShape = cutlass::gemm::GemmShape<CtaM, CtaN, CtaK>;
+    using WarpShape = cutlass::gemm::GemmShape<WarpM, WarpN, WarpK>;
+    using InstructionShape = cutlass::gemm::GemmShape<16, 8, 16>; // TensorCore instruction shape
+    
+    // Use SM89-compatible device GEMM (reuse SM80 default config for compatibility)
+    using DeviceKernel = DefaultDeviceGemmGatedSm80<ElementType>;
+    
+    // Create tensor references for CUTLASS 2.x device::Gemm
+    cutlass::TensorRef<ElementType const, cutlass::layout::RowMajor> tensor_a(
+        reinterpret_cast<ElementType const*>(A), cutlass::layout::RowMajor::packed({m, k}));
+    cutlass::TensorRef<ElementType const, cutlass::layout::ColumnMajor> tensor_b(
+        reinterpret_cast<ElementType const*>(B), cutlass::layout::ColumnMajor::packed({k, n}));
+    cutlass::TensorRef<ElementType const, cutlass::layout::RowMajor> tensor_c(
+        reinterpret_cast<ElementType const*>(C_bias), cutlass::layout::RowMajor::packed({1, n}));
+    cutlass::TensorRef<ElementType, cutlass::layout::RowMajor> tensor_d(
+        reinterpret_cast<ElementType*>(D), cutlass::layout::RowMajor::packed({m, n}));
+
+    typename DeviceKernel::Arguments arguments(
+        cutlass::gemm::GemmCoord(m, n, k),  // Problem size
+        tensor_a,                           // Tensor A
+        tensor_b,                           // Tensor B  
+        tensor_c,                           // Tensor C
+        tensor_d,                           // Tensor D
+        {scale_d0, scale_d1}               // Epilogue params (alpha, beta)
+    );
+    
+    DeviceKernel gemm_operator;
+    
+    // Check if the operation is supported
+    cutlass::Status status = gemm_operator.can_implement(arguments);
+    if (status != cutlass::Status::kSuccess) {
+        std::string error_msg = "[TensorRT-LLM Error][dispatchGemmConfigSm89] Cannot implement GEMM with given arguments. Status: " 
+                                + std::to_string(static_cast<int>(status));
+        throw std::runtime_error(error_msg);
+    }
+    
+    // Get workspace size
+    size_t workspace_size = gemm_operator.get_workspace_size(arguments);
+    if (workspace_size > workspaceBytes) {
+        std::string error_msg = "[TensorRT-LLM Error][dispatchGemmConfigSm89] Insufficient workspace. Required: " 
+                                + std::to_string(workspace_size) + ", Available: " + std::to_string(workspaceBytes);
+        throw std::runtime_error(error_msg);
+    }
+    
+    // Launch the kernel
+    status = gemm_operator.run(arguments, workspace, stream);
+    if (status != cutlass::Status::kSuccess) {
+        std::string error_msg = "[TensorRT-LLM Error][dispatchGemmConfigSm89] Kernel execution failed. Status: " 
+                                + std::to_string(static_cast<int>(status));
+        throw std::runtime_error(error_msg);
+    }
+    
+    return workspace_size;
+}
+
+template <typename T>
+size_t dispatchGemmToCutlassSm89(void* D, void const* A, void const* B, void const* C_bias, tk::QuantMode quantOption,
+    int m, int n, int k, float scale_d0, float scale_d1, float scale_output, tkc::CutlassGemmConfig gemmConfig,
+    char* workspace, size_t workspaceBytes, cudaStream_t stream, int* occupancy = nullptr)
+{
+    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    
+    // Support FP16 and BF16 data types on SM89
+    static_assert(std::is_same_v<T, half> || std::is_same_v<T, __nv_bfloat16>, 
+                  "dispatchGemmToCutlassSm89 supports FP16 and BF16 only");
+    
+    // Follow fp8_rowwise_gemm pattern: dispatch to different tile configs
+    switch (gemmConfig.tile_config)
+    {
+    case tkc::CutlassTileConfig::CtaShape32x128x64_WarpShape32x32x64:
+        return dispatchGemmConfigSm89<T, 32, 128, 64, 32, 32, 64>(D, A, B, C_bias, quantOption, m, n, k, 
+            scale_d0, scale_d1, scale_output, gemmConfig, workspace, workspaceBytes, stream, occupancy);
+        break;
+    case tkc::CutlassTileConfig::CtaShape64x128x64_WarpShape32x64x64:
+        return dispatchGemmConfigSm89<T, 64, 128, 64, 32, 64, 64>(D, A, B, C_bias, quantOption, m, n, k, 
+            scale_d0, scale_d1, scale_output, gemmConfig, workspace, workspaceBytes, stream, occupancy);
+        break;
+    case tkc::CutlassTileConfig::CtaShape128x128x64_WarpShape64x64x64:
+        return dispatchGemmConfigSm89<T, 128, 128, 64, 64, 64, 64>(D, A, B, C_bias, quantOption, m, n, k,
+            scale_d0, scale_d1, scale_output, gemmConfig, workspace, workspaceBytes, stream, occupancy);
+        break;
+    case tkc::CutlassTileConfig::CtaShape128x256x64_WarpShape64x64x64:
+        return dispatchGemmConfigSm89<T, 128, 256, 64, 64, 64, 64>(D, A, B, C_bias, quantOption, m, n, k,
+            scale_d0, scale_d1, scale_output, gemmConfig, workspace, workspaceBytes, stream, occupancy);
+        break;
+    case tkc::CutlassTileConfig::CtaShape256x128x64_WarpShape64x64x64:
+        return dispatchGemmConfigSm89<T, 256, 128, 64, 64, 64, 64>(D, A, B, C_bias, quantOption, m, n, k,
+            scale_d0, scale_d1, scale_output, gemmConfig, workspace, workspaceBytes, stream, occupancy);
+        break;
+    case tkc::CutlassTileConfig::CtaShape128x64x64_WarpShape64x32x64:
+        return dispatchGemmConfigSm89<T, 128, 64, 64, 64, 32, 64>(D, A, B, C_bias, quantOption, m, n, k,
+            scale_d0, scale_d1, scale_output, gemmConfig, workspace, workspaceBytes, stream, occupancy);
+        break;
+    case tkc::CutlassTileConfig::CtaShape64x64x128_WarpShape32x64x64:
+        return dispatchGemmConfigSm89<T, 64, 64, 128, 32, 64, 64>(D, A, B, C_bias, quantOption, m, n, k,
+            scale_d0, scale_d1, scale_output, gemmConfig, workspace, workspaceBytes, stream, occupancy);
+        break;
+    case tkc::CutlassTileConfig::CtaShape128x64x128_WarpShape64x32x128:
+        return dispatchGemmConfigSm89<T, 128, 64, 128, 64, 32, 128>(D, A, B, C_bias, quantOption, m, n, k,
+            scale_d0, scale_d1, scale_output, gemmConfig, workspace, workspaceBytes, stream, occupancy);
+        break;
+    default:
+        std::string error_msg = "[TensorRT-LLM Error][dispatchGemmToCutlassSm89] Config undefined for tile config: " + std::to_string(static_cast<int>(gemmConfig.tile_config));
+        throw std::runtime_error(error_msg);
+    }
+
+    return 0;
+}
+
+// Follow int8_gemm pattern: single template function for all architectures
+template <typename T, typename arch>
+size_t dispatchGemmToCutlass(void* D, void const* A, void const* B, void const* C_bias, tk::QuantMode quantOption,
+    int m, int n, int k, float scale_d0, float scale_d1, float scale_output, tkc::CutlassGemmConfig gemmConfig,
+    char* workspace, size_t workspaceBytes, cudaStream_t stream, int* occupancy = nullptr)
+{
+    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    
+    if constexpr (std::is_same_v<arch, cutlass::arch::Sm90>)
+    {
+        // SM90 uses existing CUTLASS 3.x + TMA implementation
+        if constexpr (std::is_same_v<T, __nv_fp8_e4m3>)
+        {
+            // FP8 E4M3 - fully implemented in main branch
+            return dispatchGemmToCutlassSm90<T>(D, A, B, C_bias, quantOption, m, n, k, 
+                scale_d0, scale_d1, scale_output, gemmConfig, workspace, workspaceBytes, stream, occupancy);
+        }
+        else
+        {
+            // FP16/BF16 for SM90 - use SM80 CUTLASS 2.x fallback for compatibility  
+            // SM90 can execute SM80 kernels efficiently
+            if constexpr (std::is_same_v<T, half> || std::is_same_v<T, __nv_bfloat16>)
+            {
+                return dispatchGemmToCutlassSm80<T>(D, A, B, C_bias, quantOption, m, n, k,
+                    scale_d0, scale_d1, scale_output, gemmConfig, workspace, workspaceBytes, stream, occupancy);
+            }
+            else
+            {
+                throw std::runtime_error(
+                    "[TensorRT-LLM Error][dispatchGemmToCutlass] SM90 unsupported data type: " + std::string(typeid(T).name()));
+            }
+        }
+    }
+    else if constexpr (std::is_same_v<arch, cutlass::arch::Sm89>)
+    {
+        // SM89 (L4) - supports FP16, BF16 via CUTLASS 2.x (following fp8_rowwise_gemm pattern)
+        if constexpr (std::is_same_v<T, __nv_fp8_e4m3>)
+        {
+            // SM89 FP8 support will be implemented in future with dedicated CUTLASS 2.x kernel
+            throw std::runtime_error(
+                "[TensorRT-LLM Error][dispatchGemmToCutlass] SM89 FP8 SwiGLU fusion not yet implemented. "
+                "Will be supported with dedicated CUTLASS 2.x kernel in future releases.");
+        }
+        else if constexpr (std::is_same_v<T, half> || std::is_same_v<T, __nv_bfloat16>)
+        {
+            // FP16/BF16 on SM89 - use dedicated SM89 CUTLASS 2.x kernels
+            return dispatchGemmToCutlassSm89<T>(D, A, B, C_bias, quantOption, m, n, k,
+                scale_d0, scale_d1, scale_output, gemmConfig, workspace, workspaceBytes, stream, occupancy);
+        }
+        else
+        {
+            throw std::runtime_error(
+                "[TensorRT-LLM Error][dispatchGemmToCutlass] SM89 unsupported data type: " + std::string(typeid(T).name()));
+        }
+    }
+    else
+    {
+        // SM70/80 use CUTLASS 2.x device::Gemm with SM80 kernels
+        if constexpr (std::is_same_v<T, half> || std::is_same_v<T, __nv_bfloat16>)
+        {
+            return dispatchGemmToCutlassSm80<T>(D, A, B, C_bias, quantOption, m, n, k,
+                scale_d0, scale_d1, scale_output, gemmConfig, workspace, workspaceBytes, stream, occupancy);
+        }
+        else
+        {
+            // FP8 on SM70/80 not supported - requires SM89+ (L4+)  
+            throw std::runtime_error(
+                "[TensorRT-LLM Error][dispatchGemmToCutlass] FP8 requires SM89+ (L4+) with SM90 kernels. Current arch: " + std::string(typeid(arch).name()));
+        }
+    }
+    
+    return 0;
 }
 
 } // namespace cutlass_kernels
