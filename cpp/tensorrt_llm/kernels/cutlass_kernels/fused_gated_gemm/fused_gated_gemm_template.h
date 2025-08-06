@@ -33,6 +33,7 @@
 
 #include "fused_gated_gemm.h"
 #include "fused_gated_gemm_kernel_template_sm80.h"
+#include "fused_gated_gemm_kernel_template_sm89.h"
 #include "fused_gated_gemm_kernel_template_sm90.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/quantization.h"
@@ -634,8 +635,8 @@ size_t dispatchGemmConfigSm89(void* D, void const* A, void const* B, void const*
     using WarpShape = cutlass::gemm::GemmShape<WarpM, WarpN, WarpK>;
     using InstructionShape = cutlass::gemm::GemmShape<16, 8, 16>; // TensorCore instruction shape
     
-    // Use SM89-compatible device GEMM (reuse SM80 default config for compatibility)
-    using DeviceKernel = DefaultDeviceGemmGatedSm80<ElementType>;
+    // Use SM89-dedicated device GEMM (using native SM89 architecture tag)
+    using DeviceKernel = DefaultDeviceGemmGatedSm89<ElementType>;
     
     // Create tensor references for CUTLASS 2.x device::Gemm
     cutlass::TensorRef<ElementType const, cutlass::layout::RowMajor> tensor_a(
