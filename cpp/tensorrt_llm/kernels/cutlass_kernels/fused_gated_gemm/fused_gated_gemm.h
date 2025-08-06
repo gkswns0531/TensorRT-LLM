@@ -81,6 +81,7 @@ private:
     size_t getWorkspaceSizeImpl(int const m, int const n, int const k);
 
     int mSm;
+    int mMultiProcessorCount;
 };
 
 } // namespace cutlass_kernels

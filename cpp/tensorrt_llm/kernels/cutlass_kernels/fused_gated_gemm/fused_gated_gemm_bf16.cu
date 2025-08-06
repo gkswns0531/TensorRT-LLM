@@ -22,8 +22,9 @@ namespace kernels
 {
 namespace cutlass_kernels
 {
-template class CutlassFusedGatedGemmRunner<half>;
+
 template class CutlassFusedGatedGemmRunner<__nv_bfloat16>;
+
 } // namespace cutlass_kernels
 } // namespace kernels
 } // namespace tensorrt_llm
