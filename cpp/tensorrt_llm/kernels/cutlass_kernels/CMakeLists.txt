@@ -197,7 +197,7 @@ set_cuda_architectures(fp8_blockscale_gemm_src 89 90 100f)
 set(FUSED_GATED_GEMM_E4M3_SRC_CU
     ${CMAKE_CURRENT_SOURCE_DIR}/fused_gated_gemm/fused_gated_gemm_e4m3.cu)
 add_library(fused_gated_gemm_e4m3_src STATIC ${FUSED_GATED_GEMM_E4M3_SRC_CU})
-set_cuda_architectures(fused_gated_gemm_e4m3_src 90)
+set_cuda_architectures(fused_gated_gemm_e4m3_src 89 90 100f)
 
 set(FUSED_GATED_GEMM_FP16_SRC_CU
     ${CMAKE_CURRENT_SOURCE_DIR}/fused_gated_gemm/fused_gated_gemm_fp16.cu)

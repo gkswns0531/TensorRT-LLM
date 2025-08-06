@@ -836,14 +836,20 @@ size_t CutlassFusedGatedGemmRunner<T>::dispatchToArch(void* D, void const* A, vo
     tkc::CutlassGemmConfig gemmConfig, char* workspace, size_t workspaceBytes, cudaStream_t stream, 
     int* occupancy)
 {
-    if (mSm >= 80 && mSm < 90)
+    if (mSm == 90)
     {
+        return dispatch_fused_gated_gemm_to_cutlass_sm90<T>(D, A, B, C_bias, quantOption, m, n, k, scale_d0, scale_d1, scale_output,
+            gemmConfig, workspace, workspaceBytes, stream, occupancy);
+    }
+    else if (mSm == 89 || mSm >= 100)
+    {
+        // SM89 (L4) and SM100+ (H100+) use SM80-compatible kernels
         return dispatch_fused_gated_gemm_to_cutlass_sm80<T>(D, A, B, C_bias, quantOption, m, n, k, scale_d0, scale_d1, scale_output,
             gemmConfig, workspace, workspaceBytes, stream, occupancy);
     }
-    else if (mSm >= 90)
+    else if (mSm >= 80)
     {
-        return dispatch_fused_gated_gemm_to_cutlass_sm90<T>(D, A, B, C_bias, quantOption, m, n, k, scale_d0, scale_d1, scale_output,
+        return dispatch_fused_gated_gemm_to_cutlass_sm80<T>(D, A, B, C_bias, quantOption, m, n, k, scale_d0, scale_d1, scale_output,
             gemmConfig, workspace, workspaceBytes, stream, occupancy);
     }
     else
