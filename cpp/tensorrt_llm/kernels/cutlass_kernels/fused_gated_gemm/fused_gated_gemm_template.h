@@ -436,15 +436,9 @@ size_t CutlassFusedGatedGemmRunner<T>::dispatchToArch(void* D, void const* A, vo
         return dispatchGemmToCutlass<T, cutlass::arch::Sm80>(D, A, B, C_bias, quantOption, m, n, k,
             scale_d0, scale_d1, scale_output, gemmConfig, workspace, workspaceBytes, stream, occupancy);
     }
-    else if (mSm >= 70 && std::is_same_v<T, half>)
-    {
-        // SM70 (V100) -> CUTLASS 2.x, FP16 only
-        return dispatchGemmToCutlass<T, cutlass::arch::Sm70>(D, A, B, C_bias, quantOption, m, n, k,
-            scale_d0, scale_d1, scale_output, gemmConfig, workspace, workspaceBytes, stream, occupancy);
-    }
     else
     {
-        std::string error_msg = "[TensorRT-LLM Error][CutlassFusedGatedGemmRunner][GEMM Dispatch] Arch unsupported for CUTLASS fused gated GEMM: SM" 
+        std::string error_msg = "[TensorRT-LLM Error][CutlassFusedGatedGemmRunner][GEMM Dispatch] Arch unsupported for CUTLASS fused gated GEMM. Requires SM80+ (A100+). Current: SM" 
                                 + std::to_string(mSm) + " with " + typeid(T).name();
         throw std::runtime_error(error_msg);
     }
@@ -473,13 +467,13 @@ std::vector<tkc::CutlassGemmConfig> CutlassFusedGatedGemmRunner<T>::getConfigs()
     // FP16/BF16 configs are provided for future implementation compatibility
     if constexpr (std::is_same_v<T, half>)
     {
-        if (mSm < 70)
+        if (mSm < 80)
         {
             throw std::runtime_error(
-                "[TensorRT-LLM Error][CutlassFusedGatedGemmRunner] FP16 fused gated GEMM requires SM70+ (V100+). Current: SM" + std::to_string(mSm));
+                "[TensorRT-LLM Error][CutlassFusedGatedGemmRunner] FP16 fused gated GEMM requires SM80+ (A100+). Current: SM" + std::to_string(mSm));
         }
         
-        // FP16 fully implemented using CUTLASS 2.x kernels (SM70/80/89 compatible)
+        // FP16 fully implemented using CUTLASS 2.x kernels (SM80/89 compatible)
         auto config_type_param = tkc::CutlassGemmConfig::CandidateConfigTypeParam::FP16_SWIGLU;
         std::vector<CutlassGemmConfig> commonConfigs = get_candidate_configs(mSm, 1, config_type_param);
         candidateConfigs.insert(candidateConfigs.end(), commonConfigs.begin(), commonConfigs.end());
@@ -797,7 +791,7 @@ size_t dispatchGemmToCutlass(void* D, void const* A, void const* B, void const* 
     }
     else
     {
-        // SM70/80 use CUTLASS 2.x device::Gemm with SM80 kernels
+        // SM80 uses CUTLASS 2.x device::Gemm with SM80 kernels
         if constexpr (std::is_same_v<T, half> || std::is_same_v<T, __nv_bfloat16>)
         {
             return dispatchGemmToCutlassSm80<T>(D, A, B, C_bias, quantOption, m, n, k,
@@ -805,7 +799,7 @@ size_t dispatchGemmToCutlass(void* D, void const* A, void const* B, void const* 
         }
         else
         {
-            // FP8 on SM70/80 not supported - requires SM89+ (L4+)  
+            // FP8 on SM80 not supported - requires SM89+ (L4+)  
             throw std::runtime_error(
                 "[TensorRT-LLM Error][dispatchGemmToCutlass] FP8 requires SM89+ (L4+) with SM90 kernels. Current arch: " + std::string(typeid(arch).name()));
         }
