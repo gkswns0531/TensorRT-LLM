@@ -76,7 +76,9 @@ struct DeviceGemmGatedSm89
     using WarpShape = WarpShape_;
     using InstructionShape = cutlass::gemm::GemmShape<16, 8, 16>;
     
-    using EpilogueOp = cutlass::epilogue::thread::LinearCombination<
+    // SwiGLU Epilogue using TensorRT-LLM's proven pattern
+    // Uses LinearCombinationSilu for SwiGLU activation: x * SiLU(gate)
+    using EpilogueOp = cutlass::epilogue::thread::LinearCombinationSilu<
         ElementD, 128 / cutlass::sizeof_bits<ElementD>::value,
         ElementAccumulator, ElementCompute>;
 
