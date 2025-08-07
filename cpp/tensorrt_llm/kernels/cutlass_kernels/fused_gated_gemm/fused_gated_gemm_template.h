@@ -195,26 +195,31 @@ size_t dispatchGemmConfigSm80(void* D, void const* A, void const* B, void const*
     using DeviceKernel = DeviceGemmGatedSm80<ElementType, AccumElementType, CTAShape, WarpShape,
         cutlass::gemm::GemmShape<1, 1, 1>>;  // ClusterShape
     
-    // 기본적인 텐서 구성 (현재는 단일 GEMM)
-    // 실제 SwiGLU는 dual GEMM이 필요하므로 별도 구현 필요
+    // 진정한 SwiGLU를 위한 DualGemm 텐서 구성
     cutlass::TensorRef<ElementType const, cutlass::layout::RowMajor> tensor_a(
         reinterpret_cast<ElementType const*>(A), cutlass::layout::RowMajor::packed({m, k}));
+    
+    // B 매트릭스: DualGemm이 내부에서 [B_linear | B_gate]로 분할 처리  
     cutlass::TensorRef<ElementType const, cutlass::layout::ColumnMajor> tensor_b(
         reinterpret_cast<ElementType const*>(B), cutlass::layout::ColumnMajor::packed({k, n}));
+    
     cutlass::TensorRef<ElementType const, cutlass::layout::RowMajor> tensor_c(
         reinterpret_cast<ElementType const*>(C_bias), cutlass::layout::RowMajor::packed({1, n}));
+    
+    // 최종 출력: n/2 크기 (SwiGLU 결과)
     cutlass::TensorRef<ElementType, cutlass::layout::RowMajor> tensor_d(
         reinterpret_cast<ElementType*>(D), cutlass::layout::RowMajor::packed({m, n/2}));
 
-    // CUTLASS 2.x device::Gemm Arguments 구조
-    typename DeviceKernel::Arguments arguments{
-        {m, n, k},                      // problem_size (GemmCoord)  
-        tensor_a,                       // ref_A (TensorRef)
-        tensor_b,                       // ref_B (TensorRef)
-        tensor_c,                       // ref_C (TensorRef)
-        tensor_d,                       // ref_D (TensorRef)
-        {scale_d0, scale_d1}           // epilogue (alpha, beta)
-    };
+    // DualGemm Arguments: B 매트릭스를 통째로 전달하고 내부에서 분할 처리
+    typename DeviceKernel::Arguments arguments(
+        {m, n/2, k},                    // problem_size (SwiGLU 출력 크기)
+        tensor_a,                       // A 매트릭스
+        tensor_b,                       // B 매트릭스 전체 (내부에서 linear/gate 분할)
+        tensor_c,                       // C bias
+        tensor_d,                       // D 출력
+        scale_d0,                       // alpha
+        scale_d1                        // beta
+    );
     
     DeviceKernel gemm_operator;
     
@@ -234,15 +239,8 @@ size_t dispatchGemmConfigSm80(void* D, void const* A, void const* B, void const*
         throw std::runtime_error(error_msg);
     }
     
-    // CUTLASS 2.x device::Gemm execution pattern: initialize + run  
-    status = gemm_operator.initialize(arguments, workspace);
-    if (status != cutlass::Status::kSuccess) {
-        std::string error_msg = "[TensorRT-LLM Error][dispatchGemmConfigSm80] Kernel initialization failed. Status: " 
-                                + std::to_string(static_cast<int>(status));
-        throw std::runtime_error(error_msg);
-    }
-    
-    status = gemm_operator.run(stream);
+    // DualGemm execution: 내부에서 dual GEMM + SwiGLU 융합 실행
+    status = gemm_operator.run(arguments, workspace, stream);
     if (status != cutlass::Status::kSuccess) {
         std::string error_msg = "[TensorRT-LLM Error][dispatchGemmConfigSm80] Kernel execution failed. Status: " 
                                 + std::to_string(static_cast<int>(status));
@@ -379,26 +377,31 @@ size_t dispatchGemmConfigSm89(void* D, void const* A, void const* B, void const*
     using DeviceKernel = DeviceGemmGatedSm89<ElementType, AccumElementType, CTAShape, WarpShape, 
         cutlass::gemm::GemmShape<1, 1, 1>>;  // ClusterShape
     
-    // 기본적인 텐서 구성 (현재는 단일 GEMM)
-    // 실제 SwiGLU는 dual GEMM이 필요하므로 별도 구현 필요
+    // 진정한 SwiGLU를 위한 DualGemm 텐서 구성 (SM89 = L4)
     cutlass::TensorRef<ElementType const, cutlass::layout::RowMajor> tensor_a(
         reinterpret_cast<ElementType const*>(A), cutlass::layout::RowMajor::packed({m, k}));
+    
+    // B 매트릭스: DualGemm이 내부에서 [B_linear | B_gate]로 분할 처리  
     cutlass::TensorRef<ElementType const, cutlass::layout::ColumnMajor> tensor_b(
         reinterpret_cast<ElementType const*>(B), cutlass::layout::ColumnMajor::packed({k, n}));
+    
     cutlass::TensorRef<ElementType const, cutlass::layout::RowMajor> tensor_c(
         reinterpret_cast<ElementType const*>(C_bias), cutlass::layout::RowMajor::packed({1, n}));
+    
+    // 최종 출력: n/2 크기 (SwiGLU 결과)
     cutlass::TensorRef<ElementType, cutlass::layout::RowMajor> tensor_d(
         reinterpret_cast<ElementType*>(D), cutlass::layout::RowMajor::packed({m, n/2}));
 
-    // CUTLASS 2.x device::Gemm Arguments 구조
-    typename DeviceKernel::Arguments arguments{
-        {m, n, k},                      // problem_size (GemmCoord)
-        tensor_a,                       // ref_A (TensorRef)
-        tensor_b,                       // ref_B (TensorRef)
-        tensor_c,                       // ref_C (TensorRef)
-        tensor_d,                       // ref_D (TensorRef)
-        {scale_d0, scale_d1}           // epilogue (alpha, beta)
-    };
+    // DualGemm Arguments: B 매트릭스를 통째로 전달하고 내부에서 분할 처리
+    typename DeviceKernel::Arguments arguments(
+        {m, n/2, k},                    // problem_size (SwiGLU 출력 크기)
+        tensor_a,                       // A 매트릭스
+        tensor_b,                       // B 매트릭스 전체 (내부에서 linear/gate 분할)
+        tensor_c,                       // C bias
+        tensor_d,                       // D 출력
+        scale_d0,                       // alpha
+        scale_d1                        // beta
+    );
     
     DeviceKernel gemm_operator;
     
@@ -419,14 +422,8 @@ size_t dispatchGemmConfigSm89(void* D, void const* A, void const* B, void const*
     }
     
     // CUTLASS 2.x device::Gemm execution pattern: initialize + run  
-    status = gemm_operator.initialize(arguments, workspace);
-    if (status != cutlass::Status::kSuccess) {
-        std::string error_msg = "[TensorRT-LLM Error][dispatchGemmConfigSm89] Kernel initialization failed. Status: " 
-                                + std::to_string(static_cast<int>(status));
-        throw std::runtime_error(error_msg);
-    }
-    
-    status = gemm_operator.run(stream);
+    // DualGemm execution: 내부에서 dual GEMM + SwiGLU 융합 실행
+    status = gemm_operator.run(arguments, workspace, stream);
     if (status != cutlass::Status::kSuccess) {
         std::string error_msg = "[TensorRT-LLM Error][dispatchGemmConfigSm89] Kernel execution failed. Status: " 
                                 + std::to_string(static_cast<int>(status));

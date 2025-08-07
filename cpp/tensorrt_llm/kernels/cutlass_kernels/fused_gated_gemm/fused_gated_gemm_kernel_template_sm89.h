@@ -28,6 +28,8 @@
 #include "cutlass/epilogue/thread/linear_combination.h"
 #include "cutlass/epilogue/thread/activation.h"
 
+#include "dual_gemm_swiglu_sm80.h"
+
 #ifdef __GNUC__
 #pragma GCC diagnostic pop
 #endif
@@ -76,64 +78,76 @@ struct DeviceGemmGatedSm89
     using WarpShape = WarpShape_;
     using InstructionShape = cutlass::gemm::GemmShape<16, 8, 8>;  // SM89도 동일한 최적 instruction shape
     
-    // SwiGLU Epilogue - 현재는 기본 SiLU 사용 (임시)
-    // 실제 SwiGLU는 두 개의 GEMM이 필요하므로 단일 epilogue로 구현 불가
+    // SwiGLU Epilogue - Phase 1: 단일 GEMM + SiLU 적용  
+    // 진정한 SwiGLU = linear * SiLU(gate)는 dual GEMM이 필요하므로
+    // 현재는 기본 LinearCombinationSilu 사용 (Phase 2에서 dual GEMM 구현 예정)
     using EpilogueOp = cutlass::epilogue::thread::LinearCombinationSilu<
         ElementD, 128 / cutlass::sizeof_bits<ElementD>::value,
         ElementAccumulator, ElementCompute>;
 
-    // SM89 최적화된 CUTLASS 2.x device::Gemm
-    using Gemm = cutlass::gemm::device::Gemm<
-        ElementA, LayoutA,
-        ElementB, LayoutB,  
-        ElementC, LayoutC,
-        ElementAccumulator,
+    // 진정한 SwiGLU를 위한 Dual GEMM 구현 (SM89 = L4)
+    using DualGemm = DualGemmSwiGLU<
+        ElementA, ElementB, ElementC, ElementD,
+        LayoutA, LayoutB, LayoutC, LayoutD,
+        ElementAccumulator, 
         cutlass::arch::OpClassTensorOp,
-        cutlass::arch::Sm89,  // SM89 architecture
+        cutlass::arch::Sm89,  // SM89 architecture (L4)
         ThreadblockShape,
         WarpShape,
         InstructionShape,
-        EpilogueOp,
-        cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
-        4,  // 4 stages - SM89도 4+ stages 최적화
-        AlignmentA,
-        AlignmentB,
-        false,  // SplitKSerial
-        cutlass::arch::OpMultiplyAdd>;  // Operator
+        4  // 4 stages - 문서 권장 최적화
+    >;
 
-    using Arguments = typename Gemm::Arguments;
-    // Note: CUTLASS 2.x uses Arguments, not Params
+    using Arguments = typename DualGemm::Arguments;
 
     static cutlass::Status can_implement(Arguments const& args) {
-        Gemm gemm_op;
-        return gemm_op.can_implement(args);
+        // DualGemm의 두 GEMM이 모두 실행 가능한지 확인
+        typename DualGemm::LinearGemm linear_gemm;
+        typename DualGemm::GateGemm gate_gemm;
+        
+        // Linear GEMM arguments 생성
+        typename DualGemm::LinearGemm::Arguments linear_args(
+            args.problem_size,
+            args.ref_A,
+            args.ref_B_linear,
+            args.ref_C,
+            cutlass::TensorRef<ElementC, LayoutC>(),  // 임시
+            args.linear_epilogue
+        );
+        
+        // Gate GEMM arguments 생성  
+        typename DualGemm::GateGemm::Arguments gate_args(
+            args.problem_size,
+            args.ref_A,
+            args.ref_B_gate,
+            cutlass::TensorRef<ElementC const, LayoutC>(),
+            cutlass::TensorRef<ElementC, LayoutC>(),  // 임시
+            args.gate_epilogue
+        );
+        
+        return (linear_gemm.can_implement(linear_args) == cutlass::Status::kSuccess &&
+                gate_gemm.can_implement(gate_args) == cutlass::Status::kSuccess) ?
+               cutlass::Status::kSuccess : cutlass::Status::kErrorInvalidProblem;
     }
     
     static size_t get_workspace_size(Arguments const& args) {
-        return Gemm::get_workspace_size(args);
+        return DualGemm::get_workspace_size(args);
     }
     
     static cutlass::Status run(Arguments const& args, void* workspace = nullptr, cudaStream_t stream = nullptr) {
-        Gemm gemm_op;
-        
-        // CUTLASS 2.x device::Gemm pattern: initialize then run
-        cutlass::Status status = gemm_op.initialize(args, workspace);
-        if (status != cutlass::Status::kSuccess) {
-            return status;
-        }
-        
-        return gemm_op.run(stream);
+        DualGemm dual_gemm_op;
+        return dual_gemm_op.run(args, workspace, stream);
     }
 };
 
-// SM89 최적화된 설정 (SM80과 동일한 최적화 적용)
+// SM89 (L4) 최적화된 설정 - SMEM 한계 고려
 template <typename ElementType>
 struct Sm89GatedGemmConfigs {
     static_assert(std::is_same_v<ElementType, cutlass::half_t> ||
                   std::is_same_v<ElementType, cutlass::bfloat16_t>);
 
-    // 문서 권장: 중간 크기 문제에 최적화된 CTA shape
-    using DefaultCTAShape = cutlass::gemm::GemmShape<128, 256, 32>;
+    // L4 SMEM 한계(100KB) 고려 - SwiGLU는 B 매트릭스가 2배이므로 작은 타일 사용
+    using DefaultCTAShape = cutlass::gemm::GemmShape<128, 128, 32>;  // 256→128로 축소
     // 문서 권장: Tensor Core 효율성을 위한 warp shape
     using DefaultWarpShape = cutlass::gemm::GemmShape<64, 64, 32>;
     using DefaultClusterShape = cutlass::gemm::GemmShape<1, 1, 1>;
@@ -145,6 +159,10 @@ struct Sm89GatedGemmConfigs {
     static constexpr int DefaultStages = 4;
     
     template<class T> using DefaultActivation = cutlass::epilogue::thread::SiLu<T>;
+    
+    // L4 특화: 더 작은 타일 옵션들 (SMEM 96KB < 100KB 보장)
+    using SmallCTAShape = cutlass::gemm::GemmShape<64, 128, 32>;     // 소형 문제용
+    using SmallWarpShape = cutlass::gemm::GemmShape<32, 64, 32>;     // 소형 문제용
 };
 
 template<typename ElementType>
