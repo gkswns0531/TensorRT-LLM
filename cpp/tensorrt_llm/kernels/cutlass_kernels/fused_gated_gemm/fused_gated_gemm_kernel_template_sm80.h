@@ -76,21 +76,9 @@ struct DeviceGemmGatedSm80
     using WarpShape = WarpShape_;
     using InstructionShape = cutlass::gemm::GemmShape<16, 8, 8>;  // SM80 최적 instruction shape
     
-    // 진정한 SwiGLU 구현을 위한 커스텀 Epilogue
-    // SwiGLU(x, gate) = x * SiLU(gate) = x * (gate / (1 + exp(-gate)))
-    template <typename T>
-    struct SwiGLUActivation {
-        CUTLASS_HOST_DEVICE
-        T operator()(T const& linear_value, T const& gate_value) const {
-            // SiLU(gate) = gate / (1 + exp(-gate))
-            T silu_gate = gate_value / (T(1.0f) + cutlass::fast_exp(-gate_value));
-            return linear_value * silu_gate;
-        }
-    };
-    
-    // 실제 SwiGLU를 위한 Dual-GEMM Epilogue 
-    using EpilogueOp = cutlass::epilogue::thread::LinearCombinationGeneric<
-        SwiGLUActivation<ElementCompute>,
+    // SwiGLU Epilogue - 현재는 기본 SiLU 사용 (임시)
+    // 실제 SwiGLU는 두 개의 GEMM이 필요하므로 단일 epilogue로 구현 불가
+    using EpilogueOp = cutlass::epilogue::thread::LinearCombinationSilu<
         ElementD, 128 / cutlass::sizeof_bits<ElementD>::value,
         ElementAccumulator, ElementCompute>;
 
