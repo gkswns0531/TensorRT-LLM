@@ -73,14 +73,14 @@ struct DeviceGemmGatedSm89
 
     // CUTLASS 2.x compatible threadblock configuration
     using ThreadblockShape = CTAShape;
-    using WarpShape = cutlass::gemm::GemmShape<32, 32, 16>;
+    using WarpShape = cutlass::gemm::GemmShape<64, 32, 32>;
     using InstructionShape = cutlass::gemm::GemmShape<16, 8, 16>;
     
     using EpilogueOp = cutlass::epilogue::thread::LinearCombination<
         ElementD, 128 / cutlass::sizeof_bits<ElementD>::value,
         ElementAccumulator, ElementCompute>;
 
-    // Pure CUTLASS 2.x device::Gemm  
+        // Pure CUTLASS 2.x device::Gemm
     using Gemm = cutlass::gemm::device::Gemm<
         ElementA, LayoutA,
         ElementB, LayoutB,  
@@ -95,7 +95,9 @@ struct DeviceGemmGatedSm89
         cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
         3,  // Stages
         AlignmentA,
-        AlignmentB>;
+        AlignmentB,
+        false,  // SplitKSerial
+        cutlass::arch::OpMultiplyAdd>;  // Operator
 
     using Arguments = typename Gemm::Arguments;
     using Params = typename Gemm::Params;
