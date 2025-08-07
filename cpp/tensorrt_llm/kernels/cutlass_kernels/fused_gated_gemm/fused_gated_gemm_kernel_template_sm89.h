@@ -74,15 +74,27 @@ struct DeviceGemmGatedSm89
     // CUTLASS 2.x compatible threadblock configuration
     using ThreadblockShape = CTAShape;
     using WarpShape = WarpShape_;
-    using InstructionShape = cutlass::gemm::GemmShape<16, 8, 16>;
+    using InstructionShape = cutlass::gemm::GemmShape<16, 8, 8>;  // SM89도 동일한 최적 instruction shape
     
-    // SwiGLU Epilogue using TensorRT-LLM's proven pattern
-    // Uses LinearCombinationSilu for SwiGLU activation: x * SiLU(gate)
-    using EpilogueOp = cutlass::epilogue::thread::LinearCombinationSilu<
+    // 진정한 SwiGLU 구현을 위한 커스텀 Epilogue
+    // SwiGLU(x, gate) = x * SiLU(gate) = x * (gate / (1 + exp(-gate)))
+    template <typename T>
+    struct SwiGLUActivation {
+        CUTLASS_HOST_DEVICE
+        T operator()(T const& linear_value, T const& gate_value) const {
+            // SiLU(gate) = gate / (1 + exp(-gate))
+            T silu_gate = gate_value / (T(1.0f) + cutlass::fast_exp(-gate_value));
+            return linear_value * silu_gate;
+        }
+    };
+    
+    // 실제 SwiGLU를 위한 Dual-GEMM Epilogue 
+    using EpilogueOp = cutlass::epilogue::thread::LinearCombinationGeneric<
+        SwiGLUActivation<ElementCompute>,
         ElementD, 128 / cutlass::sizeof_bits<ElementD>::value,
         ElementAccumulator, ElementCompute>;
 
-        // Pure CUTLASS 2.x device::Gemm
+    // SM89 최적화된 CUTLASS 2.x device::Gemm
     using Gemm = cutlass::gemm::device::Gemm<
         ElementA, LayoutA,
         ElementB, LayoutB,  
@@ -95,7 +107,7 @@ struct DeviceGemmGatedSm89
         InstructionShape,
         EpilogueOp,
         cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
-        3,  // Stages
+        4,  // 4 stages - SM89도 4+ stages 최적화
         AlignmentA,
         AlignmentB,
         false,  // SplitKSerial
@@ -126,15 +138,23 @@ struct DeviceGemmGatedSm89
     }
 };
 
-// SM89 specialized configurations
+// SM89 최적화된 설정 (SM80과 동일한 최적화 적용)
 template <typename ElementType>
 struct Sm89GatedGemmConfigs {
     static_assert(std::is_same_v<ElementType, cutlass::half_t> ||
                   std::is_same_v<ElementType, cutlass::bfloat16_t>);
 
-    using DefaultCTAShape = cutlass::gemm::GemmShape<128, 128, 32>;
-    using DefaultWarpShape = cutlass::gemm::GemmShape<64, 32, 32>;  // kWarpGemmIterations = 2
+    // 문서 권장: 중간 크기 문제에 최적화된 CTA shape
+    using DefaultCTAShape = cutlass::gemm::GemmShape<128, 256, 32>;
+    // 문서 권장: Tensor Core 효율성을 위한 warp shape
+    using DefaultWarpShape = cutlass::gemm::GemmShape<64, 64, 32>;
     using DefaultClusterShape = cutlass::gemm::GemmShape<1, 1, 1>;
+    
+    // SM89 최적 InstructionShape
+    using DefaultInstructionShape = cutlass::gemm::GemmShape<16, 8, 8>;
+    
+    // 4-stage 파이프라이닝 (문서 권장)
+    static constexpr int DefaultStages = 4;
     
     template<class T> using DefaultActivation = cutlass::epilogue::thread::SiLu<T>;
 };
