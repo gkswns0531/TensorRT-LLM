@@ -341,7 +341,7 @@ size_t dispatchGemmToCutlassSm80(void* D, void const* A, void const* B, void con
             scale_d0, scale_d1, scale_output, gemmConfig, workspace, workspaceBytes, stream, occupancy);
         break;
     default:
-        std::string error_msg = "[TensorRT-LLM Error][dispatchGemmToCutlassSm80] Config undefined for tile config: " + std::to_string(static_cast<int>(gemmConfig.tile_config));
+        std::string error_msg = "[TensorRT-LLM Error][dispatchGemmToCutlassSm80] Config undefined for tile config: " + std::to_string(static_cast<int>(gemmConfig.tile_config_sm80));
         throw std::runtime_error(error_msg);
     }
 
@@ -773,60 +773,6 @@ size_t dispatchGemmConfigSm89(void* D, void const* A, void const* B, void const*
     }
     
     return workspace_size;
-}
-
-template <typename T>
-size_t dispatchGemmToCutlassSm89(void* D, void const* A, void const* B, void const* C_bias, tk::QuantMode quantOption,
-    int m, int n, int k, float scale_d0, float scale_d1, float scale_output, tkc::CutlassGemmConfig gemmConfig,
-    char* workspace, size_t workspaceBytes, cudaStream_t stream, int* occupancy = nullptr)
-{
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
-    
-    // Support FP16 and BF16 data types on SM89
-    static_assert(std::is_same_v<T, half> || std::is_same_v<T, __nv_bfloat16>, 
-                  "dispatchGemmToCutlassSm89 supports FP16 and BF16 only");
-    
-    // Follow fp8_rowwise_gemm pattern: dispatch to different tile configs
-    switch (gemmConfig.tile_config_sm80)
-    {
-    case tkc::CutlassTileConfig::CtaShape32x128x64_WarpShape32x32x64:
-        return dispatchGemmConfigSm89<T, 32, 128, 64, 32, 32, 64>(D, A, B, C_bias, quantOption, m, n, k, 
-            scale_d0, scale_d1, scale_output, gemmConfig, workspace, workspaceBytes, stream, occupancy);
-        break;
-    case tkc::CutlassTileConfig::CtaShape64x128x64_WarpShape32x64x64:
-        return dispatchGemmConfigSm89<T, 64, 128, 64, 32, 64, 64>(D, A, B, C_bias, quantOption, m, n, k, 
-            scale_d0, scale_d1, scale_output, gemmConfig, workspace, workspaceBytes, stream, occupancy);
-        break;
-    case tkc::CutlassTileConfig::CtaShape128x128x64_WarpShape64x64x64:
-        return dispatchGemmConfigSm89<T, 128, 128, 64, 64, 64, 64>(D, A, B, C_bias, quantOption, m, n, k,
-            scale_d0, scale_d1, scale_output, gemmConfig, workspace, workspaceBytes, stream, occupancy);
-        break;
-    case tkc::CutlassTileConfig::CtaShape128x256x64_WarpShape64x64x64:
-        return dispatchGemmConfigSm89<T, 128, 256, 64, 64, 64, 64>(D, A, B, C_bias, quantOption, m, n, k,
-            scale_d0, scale_d1, scale_output, gemmConfig, workspace, workspaceBytes, stream, occupancy);
-        break;
-    case tkc::CutlassTileConfig::CtaShape256x128x64_WarpShape64x64x64:
-        return dispatchGemmConfigSm89<T, 256, 128, 64, 64, 64, 64>(D, A, B, C_bias, quantOption, m, n, k,
-            scale_d0, scale_d1, scale_output, gemmConfig, workspace, workspaceBytes, stream, occupancy);
-        break;
-    case tkc::CutlassTileConfig::CtaShape128x64x64_WarpShape64x32x64:
-        return dispatchGemmConfigSm89<T, 128, 64, 64, 64, 32, 64>(D, A, B, C_bias, quantOption, m, n, k,
-            scale_d0, scale_d1, scale_output, gemmConfig, workspace, workspaceBytes, stream, occupancy);
-        break;
-    case tkc::CutlassTileConfig::CtaShape64x64x128_WarpShape32x64x64:
-        return dispatchGemmConfigSm89<T, 64, 64, 128, 32, 64, 64>(D, A, B, C_bias, quantOption, m, n, k,
-            scale_d0, scale_d1, scale_output, gemmConfig, workspace, workspaceBytes, stream, occupancy);
-        break;
-    case tkc::CutlassTileConfig::CtaShape128x64x128_WarpShape64x32x128:
-        return dispatchGemmConfigSm89<T, 128, 64, 128, 64, 32, 128>(D, A, B, C_bias, quantOption, m, n, k,
-            scale_d0, scale_d1, scale_output, gemmConfig, workspace, workspaceBytes, stream, occupancy);
-        break;
-    default:
-        std::string error_msg = "[TensorRT-LLM Error][dispatchGemmToCutlassSm89] Config undefined for tile config: " + std::to_string(static_cast<int>(gemmConfig.tile_config_sm80));
-        throw std::runtime_error(error_msg);
-    }
-
-    return 0;
 }
 
 // Follow int8_gemm pattern: single template function for all architectures
