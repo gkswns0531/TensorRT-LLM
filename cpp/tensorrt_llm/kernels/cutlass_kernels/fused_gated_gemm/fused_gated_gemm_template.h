@@ -189,11 +189,11 @@ size_t dispatchGemmConfigSm80(void* D, void const* A, void const* B, void const*
     // Define CTA and Warp shapes 
     using CTAShape = cutlass::gemm::GemmShape<CtaM, CtaN, CtaK>;
     using WarpShape = cutlass::gemm::GemmShape<WarpM, WarpN, WarpK>;
-    using InstructionShape = cutlass::gemm::GemmShape<16, 8, 8>; // SM80 최적 instruction shape
+    using InstructionShape = typename Sm80GatedGemmConfigs<ElementType>::DefaultInstructionShape; // DefaultGemmConfiguration 호환
     
-    // Use SM80 device GEMM with CTA and Warp shapes  
+    // Use SM80 device GEMM with 수정된 template signature (Activation parameter 제거)
     using DeviceKernel = DeviceGemmGatedSm80<ElementType, AccumElementType, CTAShape, WarpShape,
-        cutlass::gemm::GemmShape<1, 1, 1>>;  // ClusterShape
+        cutlass::gemm::GemmShape<1, 1, 1>>;  // ClusterShape (SwapAB는 기본값 false 사용)
     
     // 진정한 SwiGLU를 위한 DualGemm 텐서 구성
     cutlass::TensorRef<ElementType const, cutlass::layout::RowMajor> tensor_a(
@@ -371,11 +371,11 @@ size_t dispatchGemmConfigSm89(void* D, void const* A, void const* B, void const*
     // Define CTA and Warp shapes 
     using CTAShape = cutlass::gemm::GemmShape<CtaM, CtaN, CtaK>;
     using WarpShape = cutlass::gemm::GemmShape<WarpM, WarpN, WarpK>;
-    using InstructionShape = cutlass::gemm::GemmShape<16, 8, 8>; // SM89 최적 instruction shape
+    using InstructionShape = typename Sm89GatedGemmConfigs<ElementType>::DefaultInstructionShape; // DefaultGemmConfiguration 호환
     
-    // Use SM89-dedicated device GEMM with CTA and Warp shapes
+    // Use SM89-dedicated device GEMM with 수정된 template signature (Activation parameter 제거)
     using DeviceKernel = DeviceGemmGatedSm89<ElementType, AccumElementType, CTAShape, WarpShape, 
-        cutlass::gemm::GemmShape<1, 1, 1>>;  // ClusterShape
+        cutlass::gemm::GemmShape<1, 1, 1>>;  // ClusterShape (SwapAB는 기본값 false 사용)
     
     // 진정한 SwiGLU를 위한 DualGemm 텐서 구성 (SM89 = L4)
     cutlass::TensorRef<ElementType const, cutlass::layout::RowMajor> tensor_a(

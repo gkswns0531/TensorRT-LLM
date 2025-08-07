@@ -28,7 +28,16 @@ class DualGemmSwiGLU {
 public:
     using ElementCompute = float;
     
-    // Linear GEMM 설정: A @ B_linear
+    // 안전한 Alignment 설정 (DefaultGemmConfiguration 에러 방지)
+    static constexpr int AlignmentA = 8;  // FP16/BF16에 대해 검증된 값
+    static constexpr int AlignmentB = 8;
+    static constexpr int AlignmentC = 8;
+    
+    // 안전한 Epilogue 정의 (Template template parameter 회피)
+    using LinearEpilogueOp = cutlass::epilogue::thread::LinearCombination<
+        ElementC, AlignmentC, ElementAccumulator, ElementCompute>;
+    
+    // Linear GEMM 설정: A @ B_linear (DefaultGemmConfiguration 호환)
     using LinearGemm = cutlass::gemm::device::Gemm<
         ElementA, LayoutA,
         ElementB, LayoutB,
@@ -39,13 +48,17 @@ public:
         ThreadblockShape,
         WarpShape,
         InstructionShape,
-        cutlass::epilogue::thread::LinearCombination<
-            ElementC, 128 / cutlass::sizeof_bits<ElementC>::value,
-            ElementAccumulator, ElementCompute>,
+        LinearEpilogueOp,
         cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>, 
-        Stages>;
+        Stages,
+        AlignmentA,
+        AlignmentB>;
     
-    // Gate GEMM 설정: A @ B_gate  
+    // 안전한 Gate Epilogue 정의
+    using GateEpilogueOp = cutlass::epilogue::thread::LinearCombination<
+        ElementC, AlignmentC, ElementAccumulator, ElementCompute>;
+    
+    // Gate GEMM 설정: A @ B_gate (DefaultGemmConfiguration 호환)
     using GateGemm = cutlass::gemm::device::Gemm<
         ElementA, LayoutA,
         ElementB, LayoutB,
@@ -56,11 +69,11 @@ public:
         ThreadblockShape,
         WarpShape,
         InstructionShape,
-        cutlass::epilogue::thread::LinearCombination<
-            ElementC, 128 / cutlass::sizeof_bits<ElementC>::value,
-            ElementAccumulator, ElementCompute>,
+        GateEpilogueOp,
         cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
-        Stages>;
+        Stages,
+        AlignmentA,
+        AlignmentB>;
 
     // SwiGLU 융합 함수
     struct SwiGLUFusion {
@@ -102,18 +115,23 @@ public:
         {
             // B 매트릭스 분할: [B_linear | B_gate]
             int m = problem_size.m();
-            int n = problem_size.n();  // 이미 n/2
+            int n_out = problem_size.n();  // SwiGLU 출력 크기 (n/2)
             int k = problem_size.k();
             
-            // B_linear: 첫 번째 n/2 columns (0 ~ n-1)
+            // 중요: dispatch에서 전달되는 B는 k × (2*n_out) 크기
+            // 하지만 ref_B는 이미 올바른 레이아웃으로 구성됨
+            
+            // B_linear: 첫 번째 n_out columns (0 ~ n_out-1)
             ref_B_linear = cutlass::TensorRef<ElementB const, LayoutB>(
                 ref_B.data(), 
-                cutlass::layout::RowMajor::packed({k, n}));
+                LayoutB::packed({k, n_out}));
             
-            // B_gate: 두 번째 n/2 columns (n ~ 2n-1)  
+            // B_gate: 두 번째 n_out columns (n_out ~ 2*n_out-1)
+            // LayoutB가 ColumnMajor이면: k*n_out 오프셋
+            // LayoutB가 RowMajor이면: n_out 오프셋
             ref_B_gate = cutlass::TensorRef<ElementB const, LayoutB>(
-                ref_B.data() + k * n,  // n 컬럼만큼 오프셋
-                cutlass::layout::RowMajor::packed({k, n}));
+                ref_B.data() + (std::is_same_v<LayoutB, cutlass::layout::ColumnMajor> ? k * n_out : n_out),
+                LayoutB::packed({k, n_out}));
         }
     };
 

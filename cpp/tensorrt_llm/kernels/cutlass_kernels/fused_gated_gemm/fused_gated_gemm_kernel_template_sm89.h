@@ -41,9 +41,9 @@ namespace kernels
 namespace cutlass_kernels
 {
 
-// SM89 Fused Gated GEMM kernel template (L4 GPU)
+// SM89 Fused Gated GEMM kernel template (L4 GPU) - DefaultGemmConfiguration 호환
 template <typename ElementType, typename AccumElementType, typename CTAShape, typename WarpShape_, typename ClusterShape,
-    template <class /* ElementCompute */> class Activation = cutlass::epilogue::thread::SiLu, bool SwapAB = false>
+    bool SwapAB = false>
 struct DeviceGemmGatedSm89
 {
     static_assert(std::is_same_v<ElementType, cutlass::half_t> ||
@@ -76,7 +76,7 @@ struct DeviceGemmGatedSm89
     // CUTLASS 2.x compatible threadblock configuration
     using ThreadblockShape = CTAShape;
     using WarpShape = WarpShape_;
-    using InstructionShape = cutlass::gemm::GemmShape<16, 8, 8>;  // SM89도 동일한 최적 instruction shape
+    using InstructionShape = typename Sm89GatedGemmConfigs<ElementType>::DefaultInstructionShape;  // DefaultGemmConfiguration 호환
     
     // SwiGLU Epilogue - Phase 1: 단일 GEMM + SiLU 적용  
     // 진정한 SwiGLU = linear * SiLU(gate)는 dual GEMM이 필요하므로
@@ -152,13 +152,14 @@ struct Sm89GatedGemmConfigs {
     using DefaultWarpShape = cutlass::gemm::GemmShape<64, 64, 32>;
     using DefaultClusterShape = cutlass::gemm::GemmShape<1, 1, 1>;
     
-    // SM89 최적 InstructionShape
-    using DefaultInstructionShape = cutlass::gemm::GemmShape<16, 8, 8>;
+    // SM89 표준 InstructionShape (DefaultGemmConfiguration 호환)
+    using DefaultInstructionShape = cutlass::gemm::GemmShape<16, 8, 16>;
     
     // 4-stage 파이프라이닝 (문서 권장)
     static constexpr int DefaultStages = 4;
     
-    template<class T> using DefaultActivation = cutlass::epilogue::thread::SiLu<T>;
+    // DefaultGemmConfiguration 안전성을 위해 template template parameter 제거
+    // 구체적인 activation은 DualGemmSwiGLU에서 처리됨
     
     // L4 특화: 더 작은 타일 옵션들 (SMEM 96KB < 100KB 보장)
     using SmallCTAShape = cutlass::gemm::GemmShape<64, 128, 32>;     // 소형 문제용
@@ -172,7 +173,6 @@ using DefaultDeviceGemmGatedSm89 = DeviceGemmGatedSm89<
     typename Sm89GatedGemmConfigs<ElementType>::DefaultCTAShape,                      // CTAShape  
     typename Sm89GatedGemmConfigs<ElementType>::DefaultWarpShape,                     // WarpShape_
     typename Sm89GatedGemmConfigs<ElementType>::DefaultClusterShape,                  // ClusterShape
-    Sm89GatedGemmConfigs<ElementType>::template DefaultActivation,                    // template<class> class Activation
     false                                                                             // SwapAB = false
 >;
 
