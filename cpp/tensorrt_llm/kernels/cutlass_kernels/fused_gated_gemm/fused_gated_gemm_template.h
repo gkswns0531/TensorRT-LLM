@@ -191,8 +191,9 @@ size_t dispatchGemmConfigSm80(void* D, void const* A, void const* B, void const*
     using WarpShape = cutlass::gemm::GemmShape<WarpM, WarpN, WarpK>;
     using InstructionShape = cutlass::gemm::GemmShape<16, 8, 16>; // TensorCore instruction shape
     
-    // Use SM80 device GEMM with gated activation
-    using DeviceKernel = DefaultDeviceGemmGatedSm80<ElementType>;
+    // Use SM80 device GEMM with CTA and Warp shapes  
+    using DeviceKernel = DeviceGemmGatedSm80<ElementType, AccumElementType, CTAShape, WarpShape,
+        cutlass::gemm::GemmShape<1, 1, 1>>;  // ClusterShape
     
     // Create tensor references for CUTLASS 2.x device::Gemm
     cutlass::TensorRef<ElementType const, cutlass::layout::RowMajor> tensor_a(
@@ -204,14 +205,15 @@ size_t dispatchGemmConfigSm80(void* D, void const* A, void const* B, void const*
     cutlass::TensorRef<ElementType, cutlass::layout::RowMajor> tensor_d(
         reinterpret_cast<ElementType*>(D), cutlass::layout::RowMajor::packed({m, n}));
 
-    typename DeviceKernel::Arguments arguments(
-        cutlass::gemm::GemmCoord(m, n, k),  // Problem size
-        tensor_a,                           // Tensor A
-        tensor_b,                           // Tensor B  
-        tensor_c,                           // Tensor C
-        tensor_d,                           // Tensor D
-        {scale_d0, scale_d1}               // Epilogue params (alpha, beta)
-    );
+    // CUTLASS 2.x device::Gemm Arguments 구조
+    typename DeviceKernel::Arguments arguments{
+        {m, n, k},                      // problem_size (GemmCoord)
+        tensor_a,                       // ref_A (TensorRef)
+        tensor_b,                       // ref_B (TensorRef)
+        tensor_c,                       // ref_C (TensorRef)
+        tensor_d,                       // ref_D (TensorRef)
+        {scale_d0, scale_d1}           // epilogue (alpha, beta)
+    };
     
     DeviceKernel gemm_operator;
     
@@ -365,8 +367,9 @@ size_t dispatchGemmConfigSm89(void* D, void const* A, void const* B, void const*
     using WarpShape = cutlass::gemm::GemmShape<WarpM, WarpN, WarpK>;
     using InstructionShape = cutlass::gemm::GemmShape<16, 8, 16>; // TensorCore instruction shape
     
-    // Use SM89-dedicated device GEMM (using native SM89 architecture tag)
-    using DeviceKernel = DefaultDeviceGemmGatedSm89<ElementType>;
+    // Use SM89-dedicated device GEMM with CTA and Warp shapes
+    using DeviceKernel = DeviceGemmGatedSm89<ElementType, AccumElementType, CTAShape, WarpShape, 
+        cutlass::gemm::GemmShape<1, 1, 1>>;  // ClusterShape
     
     // Create tensor references for CUTLASS 2.x device::Gemm
     cutlass::TensorRef<ElementType const, cutlass::layout::RowMajor> tensor_a(
@@ -378,14 +381,15 @@ size_t dispatchGemmConfigSm89(void* D, void const* A, void const* B, void const*
     cutlass::TensorRef<ElementType, cutlass::layout::RowMajor> tensor_d(
         reinterpret_cast<ElementType*>(D), cutlass::layout::RowMajor::packed({m, n}));
 
-    typename DeviceKernel::Arguments arguments(
-        cutlass::gemm::GemmCoord(m, n, k),  // Problem size
-        tensor_a,                           // Tensor A
-        tensor_b,                           // Tensor B  
-        tensor_c,                           // Tensor C
-        tensor_d,                           // Tensor D
-        {scale_d0, scale_d1}               // Epilogue params (alpha, beta)
-    );
+    // CUTLASS 2.x device::Gemm Arguments 구조
+    typename DeviceKernel::Arguments arguments{
+        {m, n, k},                      // problem_size (GemmCoord)
+        tensor_a,                       // ref_A (TensorRef)
+        tensor_b,                       // ref_B (TensorRef)
+        tensor_c,                       // ref_C (TensorRef)
+        tensor_d,                       // ref_D (TensorRef)
+        {scale_d0, scale_d1}           // epilogue (alpha, beta)
+    };
     
     DeviceKernel gemm_operator;
     

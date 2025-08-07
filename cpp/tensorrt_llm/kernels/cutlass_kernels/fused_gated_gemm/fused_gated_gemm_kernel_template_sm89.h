@@ -40,7 +40,7 @@ namespace cutlass_kernels
 {
 
 // SM89 Fused Gated GEMM kernel template (L4 GPU)
-template <typename ElementType, typename AccumElementType, typename CTAShape, typename ClusterShape,
+template <typename ElementType, typename AccumElementType, typename CTAShape, typename WarpShape_, typename ClusterShape,
     template <class /* ElementCompute */> class Activation = cutlass::epilogue::thread::SiLu, bool SwapAB = false>
 struct DeviceGemmGatedSm89
 {
@@ -73,7 +73,7 @@ struct DeviceGemmGatedSm89
 
     // CUTLASS 2.x compatible threadblock configuration
     using ThreadblockShape = CTAShape;
-    using WarpShape = cutlass::gemm::GemmShape<64, 32, 32>;
+    using WarpShape = WarpShape_;
     using InstructionShape = cutlass::gemm::GemmShape<16, 8, 16>;
     
     using EpilogueOp = cutlass::epilogue::thread::LinearCombination<
@@ -100,7 +100,7 @@ struct DeviceGemmGatedSm89
         cutlass::arch::OpMultiplyAdd>;  // Operator
 
     using Arguments = typename Gemm::Arguments;
-    using Params = typename Gemm::Params;
+    // Note: CUTLASS 2.x uses Arguments, not Params
 
     static cutlass::Status can_implement(Arguments const& args) {
         Gemm gemm_op;
@@ -113,7 +113,14 @@ struct DeviceGemmGatedSm89
     
     static cutlass::Status run(Arguments const& args, void* workspace = nullptr, cudaStream_t stream = nullptr) {
         Gemm gemm_op;
-        return gemm_op.run(args, workspace, stream);
+        
+        // CUTLASS 2.x device::Gemm pattern: initialize then run
+        cutlass::Status status = gemm_op.initialize(args, workspace);
+        if (status != cutlass::Status::kSuccess) {
+            return status;
+        }
+        
+        return gemm_op.run(stream);
     }
 };
 
@@ -124,6 +131,7 @@ struct Sm89GatedGemmConfigs {
                   std::is_same_v<ElementType, cutlass::bfloat16_t>);
 
     using DefaultCTAShape = cutlass::gemm::GemmShape<128, 128, 32>;
+    using DefaultWarpShape = cutlass::gemm::GemmShape<64, 32, 32>;  // kWarpGemmIterations = 2
     using DefaultClusterShape = cutlass::gemm::GemmShape<1, 1, 1>;
     
     template<class T> using DefaultActivation = cutlass::epilogue::thread::SiLu<T>;
@@ -133,6 +141,7 @@ template<typename ElementType>
 using DefaultDeviceGemmGatedSm89 = DeviceGemmGatedSm89<
     ElementType, float,  // AccumElementType = float
     typename Sm89GatedGemmConfigs<ElementType>::DefaultCTAShape,
+    typename Sm89GatedGemmConfigs<ElementType>::DefaultWarpShape,  // WarpShape 추가
     typename Sm89GatedGemmConfigs<ElementType>::DefaultClusterShape,
     Sm89GatedGemmConfigs<ElementType>::template DefaultActivation
 >;
