@@ -26,7 +26,7 @@ namespace cutlass_kernels
 // Explicit template instantiation for all supported data types
 // Following the unified architecture from Phase 1
 
-// FP16 - Supported on SM70+ (V100+)
+// FP16 - Supported on SM80+ (A100+, L4+)
 template class CutlassFusedGatedGemmRunner<half>;
 
 // BF16 - Supported on SM80+ (A100+)  

@@ -21,13 +21,11 @@
 #pragma GCC diagnostic ignored "-Wstrict-aliasing"
 #endif
 
-#include "cutlass/conv/convolution.h"
-#include "cutlass/util/packed_stride.hpp"
-
-#include "cutlass/epilogue/thread/linear_combination.h"
+// CUTLASS 2.x includes for SM89
+#include "cutlass/cutlass.h"
 #include "cutlass/gemm/device/gemm.h"
-#include "cutlass/gemm/threadblock/default_gemm_kernel.h"
-
+#include "cutlass/gemm/device/gemm_universal_adapter.h"
+#include "cutlass/epilogue/thread/linear_combination.h"
 #include "cutlass/epilogue/thread/activation.h"
 
 #ifdef __GNUC__
@@ -72,9 +70,8 @@ struct DeviceGemmGatedSm89
     // Core tensor op type
     using ElementAccumulator = AccumElementType;
     using ElementCompute = AccumElementType;
-    using ElementScale = ElementCompute;
 
-    // Use CUTLASS 2.x compatible approach for SM89
+    // CUTLASS 2.x compatible threadblock configuration
     using ThreadblockShape = CTAShape;
     using WarpShape = cutlass::gemm::GemmShape<32, 32, 16>;
     using InstructionShape = cutlass::gemm::GemmShape<16, 8, 16>;
@@ -83,13 +80,14 @@ struct DeviceGemmGatedSm89
         ElementD, 128 / cutlass::sizeof_bits<ElementD>::value,
         ElementAccumulator, ElementCompute>;
 
+    // Pure CUTLASS 2.x device::Gemm  
     using Gemm = cutlass::gemm::device::Gemm<
         ElementA, LayoutA,
         ElementB, LayoutB,  
         ElementC, LayoutC,
         ElementAccumulator,
         cutlass::arch::OpClassTensorOp,
-        cutlass::arch::Sm89,  // ✅ SM89 architecture tag
+        cutlass::arch::Sm89,  // SM89 architecture
         ThreadblockShape,
         WarpShape,
         InstructionShape,
@@ -101,9 +99,6 @@ struct DeviceGemmGatedSm89
 
     using Arguments = typename Gemm::Arguments;
     using Params = typename Gemm::Params;
-
-    // CUTLASS 2.x device::Gemm wrapper for SM89
-    // The gated activation will be handled at a higher level
 
     static cutlass::Status can_implement(Arguments const& args) {
         Gemm gemm_op;

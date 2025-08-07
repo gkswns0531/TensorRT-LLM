@@ -21,21 +21,12 @@
 #pragma GCC diagnostic ignored "-Wstrict-aliasing"
 #endif
 
-#include "cute/tensor.hpp"
-#include "cutlass/conv/convolution.h"
-#include "cutlass/util/packed_stride.hpp"
-
-#include "cutlass/epilogue/collective/default_epilogue.hpp"
-#include "cutlass/epilogue/thread/linear_combination.h"
-#include "cutlass/gemm/collective/collective_builder.hpp"
-#include "cutlass/gemm/dispatch_policy.hpp"
-
-#include "cutlass/epilogue/thread/activation.h"
-#include "cutlass_extensions/gemm/collective/collective_builder_gated.hpp"
-#include "cutlass_extensions/gemm/kernel/gemm_universal_gated.hpp"
-
-#include "cutlass/epilogue/collective/collective_builder.hpp"
+// CUTLASS 2.x includes for SM80
+#include "cutlass/cutlass.h"
+#include "cutlass/gemm/device/gemm.h"
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
+#include "cutlass/epilogue/thread/linear_combination.h"
+#include "cutlass/epilogue/thread/activation.h"
 
 #ifdef __GNUC__
 #pragma GCC diagnostic pop
@@ -47,9 +38,8 @@ namespace kernels
 {
 namespace cutlass_kernels
 {
-// Removed cute namespace - using CUTLASS 2.x only
 
-// SM80 Fused Gated GEMM kernel template  
+// SM80 Fused Gated GEMM kernel template (A100 GPU)
 template <typename ElementType, typename AccumElementType, typename CTAShape, typename ClusterShape,
     template <class /* ElementCompute */> class Activation = cutlass::epilogue::thread::SiLu, bool SwapAB = false>
 struct DeviceGemmGatedSm80
@@ -80,11 +70,8 @@ struct DeviceGemmGatedSm80
     // Core tensor op type
     using ElementAccumulator = AccumElementType;
     using ElementCompute = AccumElementType;
-    using ElementScale = ElementCompute;
 
-    // Simplified for CUTLASS 2.x compatibility - remove CuTe dependencies
-
-    // Use CUTLASS 2.x compatible approach for SM80
+    // CUTLASS 2.x compatible threadblock configuration
     using ThreadblockShape = CTAShape;
     using WarpShape = cutlass::gemm::GemmShape<32, 32, 16>;
     using InstructionShape = cutlass::gemm::GemmShape<16, 8, 16>;
@@ -93,13 +80,14 @@ struct DeviceGemmGatedSm80
         ElementD, 128 / cutlass::sizeof_bits<ElementD>::value,
         ElementAccumulator, ElementCompute>;
 
+    // Pure CUTLASS 2.x device::Gemm
     using Gemm = cutlass::gemm::device::Gemm<
         ElementA, LayoutA,
         ElementB, LayoutB,  
         ElementC, LayoutC,
         ElementAccumulator,
         cutlass::arch::OpClassTensorOp,
-        cutlass::arch::Sm80,
+        cutlass::arch::Sm80,  // SM80 architecture
         ThreadblockShape,
         WarpShape,
         InstructionShape,
@@ -112,9 +100,6 @@ struct DeviceGemmGatedSm80
     using Arguments = typename Gemm::Arguments;
     using Params = typename Gemm::Params;
 
-    // Simplified wrapper for CUTLASS 2.x device::Gemm - no custom gated activation needed
-    // The gated activation will be handled at a higher level
-
     static cutlass::Status can_implement(Arguments const& args) {
         Gemm gemm_op;
         return gemm_op.can_implement(args);
@@ -123,6 +108,7 @@ struct DeviceGemmGatedSm80
     static size_t get_workspace_size(Arguments const& args) {
         return Gemm::get_workspace_size(args);
     }
+    
     static cutlass::Status run(Arguments const& args, void* workspace = nullptr, cudaStream_t stream = nullptr) {
         Gemm gemm_op;
         return gemm_op.run(args, workspace, stream);
@@ -140,6 +126,7 @@ struct Sm80GatedGemmConfigs {
     
     template<class T> using DefaultActivation = cutlass::epilogue::thread::SiLu<T>;
 };
+
 template<typename ElementType>
 using DefaultDeviceGemmGatedSm80 = DeviceGemmGatedSm80<
     ElementType, float,  // AccumElementType = float
@@ -150,4 +137,4 @@ using DefaultDeviceGemmGatedSm80 = DeviceGemmGatedSm80<
 
 } // namespace cutlass_kernels
 } // namespace kernels  
-} // namespace tensorrt_llm 
+} // namespace tensorrt_llm

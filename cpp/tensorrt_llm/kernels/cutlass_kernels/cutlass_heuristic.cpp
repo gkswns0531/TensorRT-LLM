@@ -125,18 +125,8 @@ std::vector<CutlassTileConfig> get_candidate_tiles_fp16_swiglu_sm80(
     };
 }
 
-std::vector<CutlassTileConfig> get_candidate_tiles_fp16_swiglu_sm70(
-    CutlassGemmConfig::CandidateConfigTypeParam const config_type_param)
-{
-    return {
-        CutlassTileConfig::CtaShape32x128x64_WarpShape32x32x64,
-        CutlassTileConfig::CtaShape64x128x64_WarpShape32x64x64,
-        CutlassTileConfig::CtaShape128x128x64_WarpShape64x32x64,
-        CutlassTileConfig::CtaShape128x64x64_WarpShape64x32x64,
-        CutlassTileConfig::CtaShape64x64x128_WarpShape32x64x64,
-        CutlassTileConfig::CtaShape128x128x8_WarpShape64x64x8
-    };
-}
+// SM70 (V100) support removed - minimum requirement is SM80 (A100)
+// get_candidate_tiles_fp16_swiglu_sm70 function removed
 
 std::vector<CutlassTileConfig> get_candidate_tiles_fp16_swiglu_sm89(
     CutlassGemmConfig::CandidateConfigTypeParam const config_type_param)
@@ -266,9 +256,7 @@ std::vector<CutlassTileConfig> get_candidate_tiles(
         else if (sm == 89) {
             return get_candidate_tiles_fp16_swiglu_sm89(config_type_param);
         }
-        else if (sm == 70) {
-            return get_candidate_tiles_fp16_swiglu_sm70(config_type_param);
-        }
+        // SM70 (V100) removed - minimum requirement is SM80 (A100)
         else if (sm == 90) {
             return base_configs;
         }
