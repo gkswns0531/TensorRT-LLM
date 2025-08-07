@@ -76,7 +76,7 @@ struct DeviceGemmGatedSm80
     // CUTLASS 2.x compatible threadblock configuration
     using ThreadblockShape = CTAShape;
     using WarpShape = WarpShape_;
-    using InstructionShape = typename Sm80GatedGemmConfigs<ElementType>::DefaultInstructionShape;  // DefaultGemmConfiguration 호환
+    using InstructionShape = cutlass::gemm::GemmShape<16, 8, 16>;  // SM80 표준 InstructionShape (DefaultGemmConfiguration 호환)
     
     // SwiGLU Epilogue - Phase 1: 단일 GEMM + SiLU 적용
     // 진정한 SwiGLU = linear * SiLU(gate)는 dual GEMM이 필요하므로

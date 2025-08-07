@@ -189,7 +189,7 @@ size_t dispatchGemmConfigSm80(void* D, void const* A, void const* B, void const*
     // Define CTA and Warp shapes 
     using CTAShape = cutlass::gemm::GemmShape<CtaM, CtaN, CtaK>;
     using WarpShape = cutlass::gemm::GemmShape<WarpM, WarpN, WarpK>;
-    using InstructionShape = typename Sm80GatedGemmConfigs<ElementType>::DefaultInstructionShape; // DefaultGemmConfiguration 호환
+    using InstructionShape = cutlass::gemm::GemmShape<16, 8, 16>; // SM80 표준 InstructionShape (DefaultGemmConfiguration 호환)
     
     // Use SM80 device GEMM with 수정된 template signature (Activation parameter 제거)
     using DeviceKernel = DeviceGemmGatedSm80<ElementType, AccumElementType, CTAShape, WarpShape,
@@ -371,7 +371,7 @@ size_t dispatchGemmConfigSm89(void* D, void const* A, void const* B, void const*
     // Define CTA and Warp shapes 
     using CTAShape = cutlass::gemm::GemmShape<CtaM, CtaN, CtaK>;
     using WarpShape = cutlass::gemm::GemmShape<WarpM, WarpN, WarpK>;
-    using InstructionShape = typename Sm89GatedGemmConfigs<ElementType>::DefaultInstructionShape; // DefaultGemmConfiguration 호환
+    using InstructionShape = cutlass::gemm::GemmShape<16, 8, 16>; // SM89 표준 InstructionShape (DefaultGemmConfiguration 호환)
     
     // Use SM89-dedicated device GEMM with 수정된 template signature (Activation parameter 제거)
     using DeviceKernel = DeviceGemmGatedSm89<ElementType, AccumElementType, CTAShape, WarpShape, 
