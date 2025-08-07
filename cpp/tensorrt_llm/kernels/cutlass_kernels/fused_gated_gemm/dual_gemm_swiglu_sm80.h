@@ -181,54 +181,73 @@ public:
         }
 
         // 3. SwiGLU 융합: linear * SiLU(gate) → final_output
-        return launch_swiglu_fusion(
+        return launch_swiglu_fusion_impl(
             linear_output, gate_output, args.ref_D.data(), m, n, stream);
     }
 
 private:
-    // SwiGLU 융합 커널 런처
-    cutlass::Status launch_swiglu_fusion(
-        ElementC const* linear_ptr, 
-        ElementC const* gate_ptr,
-        ElementD* output_ptr,
-        int m, int n, 
-        cudaStream_t stream) {
-        
-        // GPU 커널 설정
-        dim3 block(256);
-        dim3 grid((m * n + block.x - 1) / block.x);
-        
-        // SwiGLU 융합 커널 실행
-        swiglu_fusion_kernel<<<grid, block, 0, stream>>>(
-            linear_ptr, gate_ptr, output_ptr, m, n);
-            
-        return cudaGetLastError() == cudaSuccess ? 
-            cutlass::Status::kSuccess : cutlass::Status::kErrorInternal;
-    }
 
-    // SwiGLU 융합 커널 구현
-    __global__ static void swiglu_fusion_kernel(
-        ElementC const* __restrict__ linear_ptr,
-        ElementC const* __restrict__ gate_ptr, 
-        ElementD* __restrict__ output_ptr,
-        int m, int n) {
-        
-        int tid = blockIdx.x * blockDim.x + threadIdx.x;
-        int total_elements = m * n;
-        
-        if (tid < total_elements) {
-            ElementC linear_val = linear_ptr[tid];
-            ElementC gate_val = gate_ptr[tid];
-            
-            // SwiGLU: linear * SiLU(gate)
-            float gate_f = static_cast<float>(gate_val);
-            float sigmoid_gate = gate_f / (1.0f + expf(-gate_f));  // SiLU
-            float linear_f = static_cast<float>(linear_val);
-            
-            output_ptr[tid] = static_cast<ElementD>(linear_f * sigmoid_gate);
-        }
-    }
+    // SwiGLU 융합 커널 런처 (전역 함수 호출)
+    template<typename ElementC_, typename ElementD_>
+    cutlass::Status launch_swiglu_fusion_impl(
+        ElementC_ const* linear_ptr,
+        ElementC_ const* gate_ptr, 
+        ElementD_* output_ptr,
+        int m, int n,
+        cudaStream_t stream);
 };
+
+// SwiGLU 융합 커널 - 클래스 외부 전역 함수로 정의
+template<typename ElementC, typename ElementD>
+__global__ void swiglu_fusion_kernel(
+    ElementC const* __restrict__ linear_ptr,
+    ElementC const* __restrict__ gate_ptr, 
+    ElementD* __restrict__ output_ptr,
+    int m, int n) {
+    
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = m * n;
+    
+    if (tid < total_elements) {
+        ElementC linear_val = linear_ptr[tid];
+        ElementC gate_val = gate_ptr[tid];
+        
+        // SwiGLU: linear * SiLU(gate)
+        float gate_f = static_cast<float>(gate_val);
+        float sigmoid_gate = gate_f / (1.0f + expf(-gate_f));  // SiLU
+        float linear_f = static_cast<float>(linear_val);
+        
+        output_ptr[tid] = static_cast<ElementD>(linear_f * sigmoid_gate);
+    }
+}
+
+// 템플릿 특수화를 위한 구현부
+template<typename ElementA, typename ElementB, typename ElementC, typename ElementD,
+         typename LayoutA, typename LayoutB, typename LayoutC, typename LayoutD, 
+         typename ElementAccumulator, typename OperatorClass, typename ArchTag, 
+         typename ThreadblockShape, typename WarpShape, typename InstructionShape, 
+         int Stages>
+template<typename ElementC_, typename ElementD_>
+cutlass::Status DualGemmSwiGLU<ElementA, ElementB, ElementC, ElementD, LayoutA, LayoutB, 
+    LayoutC, LayoutD, ElementAccumulator, OperatorClass, ArchTag, ThreadblockShape, WarpShape, 
+    InstructionShape, Stages>::launch_swiglu_fusion_impl(
+        ElementC_ const* linear_ptr,
+        ElementC_ const* gate_ptr,
+        ElementD_* output_ptr, 
+        int m, int n,
+        cudaStream_t stream) {
+    
+    // GPU 커널 설정
+    dim3 block(256);
+    dim3 grid((m * n + block.x - 1) / block.x);
+    
+    // 전역 SwiGLU 융합 커널 실행
+    swiglu_fusion_kernel<ElementC_, ElementD_><<<grid, block, 0, stream>>>(
+        linear_ptr, gate_ptr, output_ptr, m, n);
+        
+    return cudaGetLastError() == cudaSuccess ? 
+        cutlass::Status::kSuccess : cutlass::Status::kErrorInternal;
+}
 
 }  // namespace cutlass_kernels
 }  // namespace kernels  
