@@ -167,11 +167,13 @@ struct Sm89GatedGemmConfigs {
 
 template<typename ElementType>
 using DefaultDeviceGemmGatedSm89 = DeviceGemmGatedSm89<
-    ElementType, float,  // AccumElementType = float
-    typename Sm89GatedGemmConfigs<ElementType>::DefaultCTAShape,
-    typename Sm89GatedGemmConfigs<ElementType>::DefaultWarpShape,  // WarpShape 추가
-    typename Sm89GatedGemmConfigs<ElementType>::DefaultClusterShape,
-    Sm89GatedGemmConfigs<ElementType>::template DefaultActivation
+    ElementType,                                                                       // ElementType
+    float,                                                                             // AccumElementType
+    typename Sm89GatedGemmConfigs<ElementType>::DefaultCTAShape,                      // CTAShape  
+    typename Sm89GatedGemmConfigs<ElementType>::DefaultWarpShape,                     // WarpShape_
+    typename Sm89GatedGemmConfigs<ElementType>::DefaultClusterShape,                  // ClusterShape
+    Sm89GatedGemmConfigs<ElementType>::template DefaultActivation,                    // template<class> class Activation
+    false                                                                             // SwapAB = false
 >;
 
 } // namespace cutlass_kernels
