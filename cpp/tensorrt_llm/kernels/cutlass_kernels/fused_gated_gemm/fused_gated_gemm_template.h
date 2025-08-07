@@ -348,11 +348,79 @@ size_t dispatchGemmToCutlassSm80(void* D, void const* A, void const* B, void con
     return 0;
 }
 
+// SM89 config dispatch function for FP16/BF16 using CUTLASS 2.x device::Gemm
+template <typename T, int CtaM, int CtaN, int CtaK, int WarpM, int WarpN, int WarpK>
+size_t dispatchGemmConfigSm89(void* D, void const* A, void const* B, void const* C_bias, tk::QuantMode quantOption,
+    int m, int n, int k, float scale_d0, float scale_d1, float scale_output, tkc::CutlassGemmConfig gemmConfig,
+    char* workspace, size_t workspaceBytes, cudaStream_t stream, int* occupancy)
+{
+    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    
+    // Convert TensorRT-LLM types to CUTLASS types
+    using ElementType = typename std::conditional_t<std::is_same_v<T, half>, cutlass::half_t, cutlass::bfloat16_t>;
+    using AccumElementType = float;
+    
+    // Define CTA and Warp shapes (following SM80 pattern - declared but not used in DefaultDeviceGemmGatedSm80)
+    using CTAShape = cutlass::gemm::GemmShape<CtaM, CtaN, CtaK>;
+    using WarpShape = cutlass::gemm::GemmShape<WarpM, WarpN, WarpK>;
+    using InstructionShape = cutlass::gemm::GemmShape<16, 8, 16>; // TensorCore instruction shape
+    
+    // Use SM89-dedicated device GEMM (using native SM89 architecture tag)
+    using DeviceKernel = DefaultDeviceGemmGatedSm89<ElementType>;
+    
+    // Create tensor references for CUTLASS 2.x device::Gemm
+    cutlass::TensorRef<ElementType const, cutlass::layout::RowMajor> tensor_a(
+        reinterpret_cast<ElementType const*>(A), cutlass::layout::RowMajor::packed({m, k}));
+    cutlass::TensorRef<ElementType const, cutlass::layout::ColumnMajor> tensor_b(
+        reinterpret_cast<ElementType const*>(B), cutlass::layout::ColumnMajor::packed({k, n}));
+    cutlass::TensorRef<ElementType const, cutlass::layout::RowMajor> tensor_c(
+        reinterpret_cast<ElementType const*>(C_bias), cutlass::layout::RowMajor::packed({1, n}));
+    cutlass::TensorRef<ElementType, cutlass::layout::RowMajor> tensor_d(
+        reinterpret_cast<ElementType*>(D), cutlass::layout::RowMajor::packed({m, n}));
+
+    typename DeviceKernel::Arguments arguments(
+        cutlass::gemm::GemmCoord(m, n, k),  // Problem size
+        tensor_a,                           // Tensor A
+        tensor_b,                           // Tensor B  
+        tensor_c,                           // Tensor C
+        tensor_d,                           // Tensor D
+        {scale_d0, scale_d1}               // Epilogue params (alpha, beta)
+    );
+    
+    DeviceKernel gemm_operator;
+    
+    // Check if the operation is supported
+    cutlass::Status status = gemm_operator.can_implement(arguments);
+    if (status != cutlass::Status::kSuccess) {
+        std::string error_msg = "[TensorRT-LLM Error][dispatchGemmConfigSm89] Cannot implement GEMM with given arguments. Status: " 
+                                + std::to_string(static_cast<int>(status));
+        throw std::runtime_error(error_msg);
+    }
+    
+    // Get workspace size
+    size_t workspace_size = gemm_operator.get_workspace_size(arguments);
+    if (workspace_size > workspaceBytes) {
+        std::string error_msg = "[TensorRT-LLM Error][dispatchGemmConfigSm89] Insufficient workspace. Required: " 
+                                + std::to_string(workspace_size) + ", Available: " + std::to_string(workspaceBytes);
+        throw std::runtime_error(error_msg);
+    }
+    
+    // Launch the kernel
+    status = gemm_operator.run(arguments, workspace, stream);
+    if (status != cutlass::Status::kSuccess) {
+        std::string error_msg = "[TensorRT-LLM Error][dispatchGemmConfigSm89] Kernel execution failed. Status: " 
+                                + std::to_string(static_cast<int>(status));
+        throw std::runtime_error(error_msg);
+    }
+    
+    return workspace_size;
+}
+
 // SM89 dispatch function for FP16/BF16 using CUTLASS 2.x 
 template <typename T>
 size_t dispatchGemmToCutlassSm89(void* D, void const* A, void const* B, void const* C_bias, tk::QuantMode quantOption,
     int m, int n, int k, float scale_d0, float scale_d1, float scale_output, tkc::CutlassGemmConfig gemmConfig,
-    char* workspace, size_t workspaceBytes, cudaStream_t stream, int* occupancy = nullptr)
+    char* workspace, size_t workspaceBytes, cudaStream_t stream, int* occupancy)
 {
     TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
     
@@ -406,7 +474,7 @@ size_t dispatchGemmToCutlassSm89(void* D, void const* A, void const* B, void con
 template <typename T>
 size_t dispatchGemmToCutlassSm90(void* D, void const* A, void const* B, void const* C_bias, tk::QuantMode quantOption,
     int m, int n, int k, float scale_d0, float scale_d1, float scale_output, tkc::CutlassGemmConfig gemmConfig,
-    char* workspace, size_t workspaceBytes, cudaStream_t stream, int* occupancy = nullptr)
+    char* workspace, size_t workspaceBytes, cudaStream_t stream, int* occupancy)
 {
     TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
     // SM90 TMA currently supports FP8 E4M3 only
@@ -707,73 +775,7 @@ size_t CutlassFusedGatedGemmRunner<T>::getWorkspaceSize(int const m, int const n
     return workspace_size;
 }
 
-// SM89 config dispatch function for FP16/BF16 using CUTLASS 2.x device::Gemm
-template <typename T, int CtaM, int CtaN, int CtaK, int WarpM, int WarpN, int WarpK>
-size_t dispatchGemmConfigSm89(void* D, void const* A, void const* B, void const* C_bias, tk::QuantMode quantOption,
-    int m, int n, int k, float scale_d0, float scale_d1, float scale_output, tkc::CutlassGemmConfig gemmConfig,
-    char* workspace, size_t workspaceBytes, cudaStream_t stream, int* occupancy = nullptr)
-{
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
-    
-    // Convert TensorRT-LLM types to CUTLASS types
-    using ElementType = typename std::conditional_t<std::is_same_v<T, half>, cutlass::half_t, cutlass::bfloat16_t>;
-    using AccumElementType = float;
-    
-    // Define CTA and Warp shapes (following SM80 pattern - declared but not used in DefaultDeviceGemmGatedSm80)
-    using CTAShape = cutlass::gemm::GemmShape<CtaM, CtaN, CtaK>;
-    using WarpShape = cutlass::gemm::GemmShape<WarpM, WarpN, WarpK>;
-    using InstructionShape = cutlass::gemm::GemmShape<16, 8, 16>; // TensorCore instruction shape
-    
-    // Use SM89-dedicated device GEMM (using native SM89 architecture tag)
-    using DeviceKernel = DefaultDeviceGemmGatedSm89<ElementType>;
-    
-    // Create tensor references for CUTLASS 2.x device::Gemm
-    cutlass::TensorRef<ElementType const, cutlass::layout::RowMajor> tensor_a(
-        reinterpret_cast<ElementType const*>(A), cutlass::layout::RowMajor::packed({m, k}));
-    cutlass::TensorRef<ElementType const, cutlass::layout::ColumnMajor> tensor_b(
-        reinterpret_cast<ElementType const*>(B), cutlass::layout::ColumnMajor::packed({k, n}));
-    cutlass::TensorRef<ElementType const, cutlass::layout::RowMajor> tensor_c(
-        reinterpret_cast<ElementType const*>(C_bias), cutlass::layout::RowMajor::packed({1, n}));
-    cutlass::TensorRef<ElementType, cutlass::layout::RowMajor> tensor_d(
-        reinterpret_cast<ElementType*>(D), cutlass::layout::RowMajor::packed({m, n}));
 
-    typename DeviceKernel::Arguments arguments(
-        cutlass::gemm::GemmCoord(m, n, k),  // Problem size
-        tensor_a,                           // Tensor A
-        tensor_b,                           // Tensor B  
-        tensor_c,                           // Tensor C
-        tensor_d,                           // Tensor D
-        {scale_d0, scale_d1}               // Epilogue params (alpha, beta)
-    );
-    
-    DeviceKernel gemm_operator;
-    
-    // Check if the operation is supported
-    cutlass::Status status = gemm_operator.can_implement(arguments);
-    if (status != cutlass::Status::kSuccess) {
-        std::string error_msg = "[TensorRT-LLM Error][dispatchGemmConfigSm89] Cannot implement GEMM with given arguments. Status: " 
-                                + std::to_string(static_cast<int>(status));
-        throw std::runtime_error(error_msg);
-    }
-    
-    // Get workspace size
-    size_t workspace_size = gemm_operator.get_workspace_size(arguments);
-    if (workspace_size > workspaceBytes) {
-        std::string error_msg = "[TensorRT-LLM Error][dispatchGemmConfigSm89] Insufficient workspace. Required: " 
-                                + std::to_string(workspace_size) + ", Available: " + std::to_string(workspaceBytes);
-        throw std::runtime_error(error_msg);
-    }
-    
-    // Launch the kernel
-    status = gemm_operator.run(arguments, workspace, stream);
-    if (status != cutlass::Status::kSuccess) {
-        std::string error_msg = "[TensorRT-LLM Error][dispatchGemmConfigSm89] Kernel execution failed. Status: " 
-                                + std::to_string(static_cast<int>(status));
-        throw std::runtime_error(error_msg);
-    }
-    
-    return workspace_size;
-}
 
 // Follow int8_gemm pattern: single template function for all architectures
 template <typename T, typename arch>
