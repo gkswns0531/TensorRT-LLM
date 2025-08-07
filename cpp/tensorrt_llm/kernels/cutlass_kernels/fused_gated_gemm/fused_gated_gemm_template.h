@@ -154,6 +154,8 @@ size_t genericGemmGatedKernelLauncherSm90(void* D, void const* A, void const* B,
 #ifdef COMPILE_HOPPER_TMA_GEMMS
     using ElementT = typename TllmToCutlassTypeAdapter<T>::type;
     using AccumElementType = float;
+    
+    // FP8 E4M3 specialized TMA schedules with fast accumulation
     using MainloopScheduleType = cute::conditional_t<size<0>(CTAShape{}) == Int<64>{},
         cutlass::gemm::KernelTmaWarpSpecializedPingpongFP8FastAccum,
         cutlass::gemm::KernelTmaWarpSpecializedCooperativeFP8FastAccum>;
@@ -336,7 +338,9 @@ size_t dispatchGemmToCutlassSm90(void* D, void const* A, void const* B, void con
     char* workspace, size_t workspaceBytes, cudaStream_t stream, int* occupancy = nullptr)
 {
     TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
-    static_assert(std::is_same_v<T, __nv_fp8_e4m3>, "fusedGatedGemmSm90 only support FP8(e4m3)");
+    // SM90 TMA currently supports FP8 E4M3 only
+    // FP16/BF16 support will be added in future PR with low_latency_gemm integration
+    static_assert(std::is_same_v<T, __nv_fp8_e4m3>, "fusedGatedGemmSm90 only supports FP8(e4m3)");
     constexpr int Ktile = 128 / sizeof(T);
     using _Ktile = Int<Ktile>;
     switch (gemmConfig.tile_config_sm90)
@@ -417,22 +421,23 @@ size_t CutlassFusedGatedGemmRunner<T>::dispatchToArch(void* D, void const* A, vo
 {
     TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
     
-    // Follow int8_gemm pattern: architecture-based dispatch with precise targeting
+    // Architecture-based dispatch following TensorRT-LLM patterns
     if (mSm >= 90)
     {
-        // SM90+ (H100, B100+) -> CUTLASS 3.x with TMA + WGMMA for optimal performance
+        // SM90+ (H100, B100+) -> FP8 E4M3 uses CUTLASS 3.x with TMA + WGMMA
+        // FP16/BF16 will be implemented in future PR using low_latency_gemm 
         return dispatchGemmToCutlass<T, cutlass::arch::Sm90>(D, A, B, C_bias, quantOption, m, n, k, 
             scale_d0, scale_d1, scale_output, gemmConfig, workspace, workspaceBytes, stream, occupancy);
     }
     else if (mSm == 89)
     {
-        // SM89 (L4) -> Supports FP16, BF16 via CUTLASS 2.x (FP8 not yet implemented)
+        // SM89 (L4) -> FP16/BF16 SwiGLU fusion fully implemented with dedicated SM89 CUTLASS 2.x kernels
         return dispatchGemmToCutlass<T, cutlass::arch::Sm89>(D, A, B, C_bias, quantOption, m, n, k,
             scale_d0, scale_d1, scale_output, gemmConfig, workspace, workspaceBytes, stream, occupancy);
     }
     else if (mSm >= 80)
     {
-        // SM80 (A100) -> CUTLASS 2.x device::Gemm, FP16/BF16 only  
+        // SM80 (A100) -> FP16/BF16 SwiGLU fusion fully implemented with CUTLASS 2.x device::Gemm
         return dispatchGemmToCutlass<T, cutlass::arch::Sm80>(D, A, B, C_bias, quantOption, m, n, k,
             scale_d0, scale_d1, scale_output, gemmConfig, workspace, workspaceBytes, stream, occupancy);
     }
@@ -463,8 +468,9 @@ std::vector<tkc::CutlassGemmConfig> CutlassFusedGatedGemmRunner<T>::getConfigs()
 
     std::vector<CutlassGemmConfig> candidateConfigs;
 
-    // Current implementation status: only FP8 E4M3 is fully supported
-    // FP16/BF16 configs are provided for future implementation compatibility
+    // Current implementation status:
+    // - A100/L4 (SM80/89): FP16/BF16 SwiGLU fusion fully implemented with CUTLASS 2.x
+    // - H100 (SM90): FP8 E4M3 supported, FP16/BF16 will be implemented in future PR
     if constexpr (std::is_same_v<T, half>)
     {
         if (mSm < 80)
@@ -473,7 +479,16 @@ std::vector<tkc::CutlassGemmConfig> CutlassFusedGatedGemmRunner<T>::getConfigs()
                 "[TensorRT-LLM Error][CutlassFusedGatedGemmRunner] FP16 fused gated GEMM requires SM80+ (A100+). Current: SM" + std::to_string(mSm));
         }
         
-        // FP16 fully implemented using CUTLASS 2.x kernels (SM80/89 compatible)
+        // FP16 SwiGLU fusion - A100/L4 support only
+        // H100 FP16 will be implemented in future PR with low_latency_gemm integration  
+        if (mSm >= 90)
+        {
+            throw std::runtime_error(
+                "[TensorRT-LLM Error][CutlassFusedGatedGemmRunner] H100 FP16 SwiGLU fusion will be implemented "
+                "in future release with advanced TMA optimization. Current implementation supports A100/L4 only.");
+        }
+        
+        // SM80/89: CUTLASS 2.x kernels with FP16 SwiGLU-optimized tile configurations
         auto config_type_param = tkc::CutlassGemmConfig::CandidateConfigTypeParam::FP16_SWIGLU;
         std::vector<CutlassGemmConfig> commonConfigs = get_candidate_configs(mSm, 1, config_type_param);
         candidateConfigs.insert(candidateConfigs.end(), commonConfigs.begin(), commonConfigs.end());
@@ -486,7 +501,16 @@ std::vector<tkc::CutlassGemmConfig> CutlassFusedGatedGemmRunner<T>::getConfigs()
                 "[TensorRT-LLM Error][CutlassFusedGatedGemmRunner] BF16 fused gated GEMM requires SM80+ (A100+). Current: SM" + std::to_string(mSm));
         }
         
-        // BF16 fully implemented using CUTLASS 2.x kernels (SM80/89 compatible) with SwiGLU-optimized tiles
+        // BF16 SwiGLU fusion - A100/L4 support only
+        // H100 BF16 will be implemented in future PR with low_latency_gemm integration
+        if (mSm >= 90)
+        {
+            throw std::runtime_error(
+                "[TensorRT-LLM Error][CutlassFusedGatedGemmRunner] H100 BF16 SwiGLU fusion will be implemented "
+                "in future release with advanced TMA optimization. Current implementation supports A100/L4 only.");
+        }
+        
+        // SM80/89: CUTLASS 2.x kernels with BF16 SwiGLU-optimized tile configurations  
         auto config_type_param = tkc::CutlassGemmConfig::CandidateConfigTypeParam::FP16_SWIGLU;
         std::vector<CutlassGemmConfig> commonConfigs = get_candidate_configs(mSm, 1, config_type_param);
         candidateConfigs.insert(candidateConfigs.end(), commonConfigs.begin(), commonConfigs.end());
@@ -751,20 +775,18 @@ size_t dispatchGemmToCutlass(void* D, void const* A, void const* B, void const* 
             return dispatchGemmToCutlassSm90<T>(D, A, B, C_bias, quantOption, m, n, k, 
                 scale_d0, scale_d1, scale_output, gemmConfig, workspace, workspaceBytes, stream, occupancy);
         }
+        else if constexpr (std::is_same_v<T, half> || std::is_same_v<T, __nv_bfloat16>)
+        {
+            // H100 FP16/BF16 optimization will be implemented in future PR using low_latency_gemm
+            // Current PR focuses on A100/L4 FP16/BF16 support only
+            throw std::runtime_error(
+                "[TensorRT-LLM Error][dispatchGemmToCutlass] H100 FP16/BF16 SwiGLU fusion will be implemented "
+                "in future release with advanced TMA optimization. Current implementation supports A100/L4 only.");
+        }
         else
         {
-            // FP16/BF16 for SM90 - use SM80 CUTLASS 2.x fallback for compatibility  
-            // SM90 can execute SM80 kernels efficiently
-            if constexpr (std::is_same_v<T, half> || std::is_same_v<T, __nv_bfloat16>)
-            {
-                return dispatchGemmToCutlassSm80<T>(D, A, B, C_bias, quantOption, m, n, k,
-                    scale_d0, scale_d1, scale_output, gemmConfig, workspace, workspaceBytes, stream, occupancy);
-            }
-            else
-            {
-                throw std::runtime_error(
-                    "[TensorRT-LLM Error][dispatchGemmToCutlass] SM90 unsupported data type: " + std::string(typeid(T).name()));
-            }
+            throw std::runtime_error(
+                "[TensorRT-LLM Error][dispatchGemmToCutlass] SM90 unsupported data type: " + std::string(typeid(T).name()));
         }
     }
     else if constexpr (std::is_same_v<arch, cutlass::arch::Sm89>)
