@@ -215,10 +215,11 @@ size_t dispatchGemmConfigSm80(void* D, void const* A, void const* B, void const*
         {m, n/2, k},                    // problem_size (SwiGLU 출력 크기)
         tensor_a,                       // A 매트릭스
         tensor_b,                       // B 매트릭스 전체 (내부에서 linear/gate 분할)
-        tensor_c,                       // C bias
+        tensor_c,                       // C bias (1 x 2*n_out)
         tensor_d,                       // D 출력
         scale_d0,                       // alpha
-        scale_d1                        // beta
+        /*beta_unused*/ 0.0f,           // beta는 DualGemm에서 미사용(최종 커널에서 bias 적용)
+        scale_output                    // output scale 적용
     );
     
     DeviceKernel gemm_operator;
@@ -233,6 +234,10 @@ size_t dispatchGemmConfigSm80(void* D, void const* A, void const* B, void const*
     
     // Get workspace size
     size_t workspace_size = gemm_operator.get_workspace_size(arguments);
+    // Query mode: when pointers are null, return size without requiring buffer
+    if (!A && !B && !C_bias && !D) {
+        return workspace_size;
+    }
     if (workspace_size > workspaceBytes) {
         std::string error_msg = "[TensorRT-LLM Error][dispatchGemmConfigSm80] Insufficient workspace. Required: " 
                                 + std::to_string(workspace_size) + ", Available: " + std::to_string(workspaceBytes);
@@ -397,10 +402,11 @@ size_t dispatchGemmConfigSm89(void* D, void const* A, void const* B, void const*
         {m, n/2, k},                    // problem_size (SwiGLU 출력 크기)
         tensor_a,                       // A 매트릭스
         tensor_b,                       // B 매트릭스 전체 (내부에서 linear/gate 분할)
-        tensor_c,                       // C bias
+        tensor_c,                       // C bias (1 x 2*n_out)
         tensor_d,                       // D 출력
         scale_d0,                       // alpha
-        scale_d1                        // beta
+        /*beta_unused*/ 0.0f,           // beta는 DualGemm에서 미사용(최종 커널에서 bias 적용)
+        scale_output                    // output scale 적용
     );
     
     DeviceKernel gemm_operator;
@@ -415,6 +421,10 @@ size_t dispatchGemmConfigSm89(void* D, void const* A, void const* B, void const*
     
     // Get workspace size
     size_t workspace_size = gemm_operator.get_workspace_size(arguments);
+    // Query mode: when pointers are null, return size without requiring buffer
+    if (!A && !B && !C_bias && !D) {
+        return workspace_size;
+    }
     if (workspace_size > workspaceBytes) {
         std::string error_msg = "[TensorRT-LLM Error][dispatchGemmConfigSm89] Insufficient workspace. Required: " 
                                 + std::to_string(workspace_size) + ", Available: " + std::to_string(workspaceBytes);

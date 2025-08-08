@@ -93,28 +93,30 @@ public:
         cutlass::TensorRef<ElementA const, LayoutA> ref_A;
         cutlass::TensorRef<ElementB const, LayoutB> ref_B_linear;   // B의 첫 n/2 columns
         cutlass::TensorRef<ElementB const, LayoutB> ref_B_gate;     // B의 다음 n/2 columns  
-        cutlass::TensorRef<ElementC const, LayoutC> ref_C;
+        cutlass::TensorRef<ElementC const, LayoutC> ref_C;          // 전체 bias [b_u | b_g] (1 x 2n_out)
         cutlass::TensorRef<ElementD, LayoutD> ref_D;
         typename LinearGemm::EpilogueOutputOp::Params linear_epilogue;
         typename GateGemm::EpilogueOutputOp::Params gate_epilogue;
+        ElementCompute output_scale;                                  // 최종 출력 스케일
         
         // 생성자
         Arguments(cutlass::gemm::GemmCoord const& problem_size,
                   cutlass::TensorRef<ElementA const, LayoutA> ref_A,
                   cutlass::TensorRef<ElementB const, LayoutB> ref_B,  // 전체 B
-                  cutlass::TensorRef<ElementC const, LayoutC> ref_C,
+                  cutlass::TensorRef<ElementC const, LayoutC> ref_C,  // 전체 C (bias)
                   cutlass::TensorRef<ElementD, LayoutD> ref_D,
                   ElementCompute alpha = ElementCompute(1),
-                  ElementCompute beta = ElementCompute(0))
+                  ElementCompute /*beta_unused*/ = ElementCompute(0),
+                  ElementCompute output_scale = ElementCompute(1))
             : problem_size(problem_size)
             , ref_A(ref_A)
             , ref_C(ref_C)
             , ref_D(ref_D)
-            , linear_epilogue({alpha, beta})
-            , gate_epilogue({alpha, ElementCompute(0)})  // gate는 bias 없이
+            , linear_epilogue({alpha, ElementCompute(0)})  // GEMM 단계에서는 bias 미적용 (beta=0)
+            , gate_epilogue({alpha, ElementCompute(0)})    // GEMM 단계에서는 bias 미적용 (beta=0)
+            , output_scale(output_scale)
         {
             // B 매트릭스 분할: [B_linear | B_gate]
-            int m = problem_size.m();
             int n_out = problem_size.n();  // SwiGLU 출력 크기 (n/2)
             int k = problem_size.k();
             
@@ -172,7 +174,7 @@ public:
             args.problem_size,
             args.ref_A,
             args.ref_B_linear,
-            args.ref_C,
+            cutlass::TensorRef<ElementC const, LayoutC>(),  // beta=0, C 미사용
             linear_tensor,
             args.linear_epilogue
         );
@@ -198,9 +200,21 @@ public:
             return status;
         }
 
-        // 3. SwiGLU 융합: linear * SiLU(gate) → final_output
+        // 3. SwiGLU 융합: (linear + b_u) * SiLU(gate + b_g) * output_scale → final_output
+        // bias는 ref_C의 [0:n) = b_u, [n:2n) = b_g 로 가정(RowMajor 1 x 2n)
+        ElementC const* bias_linear = args.ref_C.data();
+        ElementC const* bias_gate = args.ref_C.data() ? (args.ref_C.data() + n) : nullptr;
+
         return launch_swiglu_fusion_impl(
-            linear_output, gate_output, args.ref_D.data(), m, n, stream);
+            linear_output,
+            gate_output,
+            args.ref_D.data(),
+            bias_linear,
+            bias_gate,
+            m,
+            n,
+            args.output_scale,
+            stream);
     }
 
 private:
@@ -211,7 +225,11 @@ private:
         ElementC_ const* linear_ptr,
         ElementC_ const* gate_ptr, 
         ElementD_* output_ptr,
-        int m, int n,
+        ElementC_ const* bias_linear_ptr,
+        ElementC_ const* bias_gate_ptr,
+        int m,
+        int n,
+        ElementCompute output_scale,
         cudaStream_t stream);
 };
 
@@ -221,7 +239,11 @@ __global__ void swiglu_fusion_kernel(
     ElementC const* __restrict__ linear_ptr,
     ElementC const* __restrict__ gate_ptr, 
     ElementD* __restrict__ output_ptr,
-    int m, int n) {
+    ElementC const* __restrict__ bias_linear_ptr,
+    ElementC const* __restrict__ bias_gate_ptr,
+    int m,
+    int n,
+    float output_scale) {
     
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     int total_elements = m * n;
@@ -230,12 +252,22 @@ __global__ void swiglu_fusion_kernel(
         ElementC linear_val = linear_ptr[tid];
         ElementC gate_val = gate_ptr[tid];
         
-        // SwiGLU: linear * SiLU(gate)
-        float gate_f = static_cast<float>(gate_val);
-        float sigmoid_gate = gate_f / (1.0f + expf(-gate_f));  // SiLU
+        // SwiGLU: (linear + b_u) * SiLU(gate + b_g) * output_scale
+        int col = tid % n;
         float linear_f = static_cast<float>(linear_val);
+        float gate_f = static_cast<float>(gate_val);
+
+        if (bias_linear_ptr) {
+            linear_f += static_cast<float>(bias_linear_ptr[col]);
+        }
+        if (bias_gate_ptr) {
+            gate_f += static_cast<float>(bias_gate_ptr[col]);
+        }
+
+        float sigmoid_gate = gate_f / (1.0f + expf(-gate_f));  // SiLU
+        float fused = (linear_f * sigmoid_gate) * output_scale;
         
-        output_ptr[tid] = static_cast<ElementD>(linear_f * sigmoid_gate);
+        output_ptr[tid] = static_cast<ElementD>(fused);
     }
 }
 
@@ -251,8 +283,12 @@ cutlass::Status DualGemmSwiGLU<ElementA, ElementB, ElementC, ElementD, LayoutA, 
     InstructionShape, Stages>::launch_swiglu_fusion_impl(
         ElementC_ const* linear_ptr,
         ElementC_ const* gate_ptr,
-        ElementD_* output_ptr, 
-        int m, int n,
+        ElementD_* output_ptr,
+        ElementC_ const* bias_linear_ptr,
+        ElementC_ const* bias_gate_ptr,
+        int m,
+        int n,
+        ElementCompute output_scale,
         cudaStream_t stream) {
     
     // GPU 커널 설정
@@ -261,7 +297,14 @@ cutlass::Status DualGemmSwiGLU<ElementA, ElementB, ElementC, ElementD, LayoutA, 
     
     // 전역 SwiGLU 융합 커널 실행
     swiglu_fusion_kernel<ElementC_, ElementD_><<<grid, block, 0, stream>>>(
-        linear_ptr, gate_ptr, output_ptr, m, n);
+        linear_ptr,
+        gate_ptr,
+        output_ptr,
+        bias_linear_ptr,
+        bias_gate_ptr,
+        m,
+        n,
+        static_cast<float>(output_scale));
         
     return cudaGetLastError() == cudaSuccess ? 
         cutlass::Status::kSuccess : cutlass::Status::kErrorInternal;
