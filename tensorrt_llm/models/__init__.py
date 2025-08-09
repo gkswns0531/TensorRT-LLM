@@ -59,6 +59,7 @@ from .opt.model import OPTForCausalLM, OPTModel
 from .phi3.model import Phi3ForCausalLM, Phi3Model
 from .phi.model import PhiForCausalLM, PhiModel
 from .qwen.model import QWenForCausalLM
+from .gpt_oss.model import GptOssForCausalLM
 from .recurrentgemma.model import RecurrentGemmaForCausalLM
 from .redrafter.model import ReDrafterForLLaMALM, ReDrafterForQWenLM
 from .stdit.model import STDiT3Model
@@ -113,6 +114,7 @@ __all__ = [
     'QWenConfig'
     'QWenForCausalLM',
     'QWenModel',
+    'GptOssForCausalLM',
     'EncoderModel',
     'DecoderModel',
     'PretrainedConfig',
@@ -200,6 +202,7 @@ MODEL_MAP = {
     'WhisperEncoder': WhisperEncoder,
     'EncoderModel': EncoderModel,
     'DecoderModel': DecoderModel,
+    'GptOssForCausalLM': GptOssForCausalLM,
     'DbrxForCausalLM': DbrxForCausalLM,
     'RecurrentGemmaForCausalLM': RecurrentGemmaForCausalLM,
     'CogVLMForCausalLM': CogVLMForCausalLM,
