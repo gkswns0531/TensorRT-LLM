@@ -168,9 +168,23 @@ def convert_and_save(
                     gate_up_blocks = get(f'model.layers.{i}.mlp.experts.gate_up_proj_blocks')
                     gate_up_scales = get(f'model.layers.{i}.mlp.experts.gate_up_proj_scales')
                     gate_up_bias = get(f'model.layers.{i}.mlp.experts.gate_up_proj_bias')
-                    weights[f'transformer.layers.{i}.mlp.experts.gate_up_proj.blocks'] = gate_up_blocks.contiguous()
-                    weights[f'transformer.layers.{i}.mlp.experts.gate_up_proj.scales'] = gate_up_scales.contiguous()
-                    weights[f'transformer.layers.{i}.mlp.experts.gate_up_proj.bias'] = gate_up_bias.contiguous()
+                    # Deinterleave gate/up along expert channel axis then concatenate
+                    gub_flat = gate_up_blocks.flatten(-2, -1)
+                    gub_sc_flat = gate_up_scales.flatten(-2, -1)
+                    gate_w = gub_flat[:, ::2, :]
+                    up_w = gub_flat[:, 1::2, :]
+                    gate_sc = gub_sc_flat[:, ::2, :]
+                    up_sc = gub_sc_flat[:, 1::2, :]
+                    # Concatenate gate, up along channel axis (following Qwen mapping style)
+                    fc_blocks = torch.cat([gate_w, up_w], dim=-2).contiguous()
+                    fc_scales = torch.cat([gate_sc, up_sc], dim=-2).contiguous()
+                    # Bias: interleaved pairs gate/up across last dim
+                    gate_b = gate_up_bias[:, ::2]
+                    up_b = gate_up_bias[:, 1::2]
+                    fc_bias = torch.cat([gate_b, up_b], dim=-1).contiguous()
+                    weights[f'transformer.layers.{i}.mlp.fc.blocks'] = fc_blocks
+                    weights[f'transformer.layers.{i}.mlp.fc.scales'] = fc_scales
+                    weights[f'transformer.layers.{i}.mlp.fc.bias'] = fc_bias
                 except Exception as e:
                     logger.info(f"layer {i}: gate_up_proj not found ({e})")
 
@@ -178,9 +192,11 @@ def convert_and_save(
                     down_blocks = get(f'model.layers.{i}.mlp.experts.down_proj_blocks')
                     down_scales = get(f'model.layers.{i}.mlp.experts.down_proj_scales')
                     down_bias = get(f'model.layers.{i}.mlp.experts.down_proj_bias')
-                    weights[f'transformer.layers.{i}.mlp.experts.down_proj.blocks'] = down_blocks.contiguous()
-                    weights[f'transformer.layers.{i}.mlp.experts.down_proj.scales'] = down_scales.contiguous()
-                    weights[f'transformer.layers.{i}.mlp.experts.down_proj.bias'] = down_bias.contiguous()
+                    proj_blocks = down_blocks.flatten(-2, -1).contiguous()
+                    proj_scales = down_scales.flatten(-2, -1).contiguous()
+                    weights[f'transformer.layers.{i}.mlp.proj.blocks'] = proj_blocks
+                    weights[f'transformer.layers.{i}.mlp.proj.scales'] = proj_scales
+                    weights[f'transformer.layers.{i}.mlp.proj.bias'] = down_bias.contiguous()
                 except Exception as e:
                     logger.info(f"layer {i}: down_proj not found ({e})")
 
