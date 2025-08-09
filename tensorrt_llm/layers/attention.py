@@ -1146,7 +1146,7 @@ class Attention(Module):
                 host_past_key_value_lengths,
                 host_max_attention_window_sizes=kv_cache_params.
                 host_max_attention_window_sizes,
-                host_sink_token_length=kv_cache_params.host_sink_token_length,
+                host_sink_token_length=kv_cache_params.host_sink_token_length if hasattr(kv_cache_params, 'host_sink_token_length') and kv_cache_params.host_sink_token_length is not None else constant(int32_array(self._get_sink_token_length())),
                 context_lengths=attention_params.context_lengths,
                 cache_indirection=kv_cache_params.cache_indirection,
                 host_request_types=attention_params.host_request_types,

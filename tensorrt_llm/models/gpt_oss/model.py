@@ -169,6 +169,41 @@ class GptOssForCausalLM(DecoderModelForCausalLM):
 
         super().__init__(config, transformer, lm_head)
 
+        # Customize weight loader mapping for MoE to match gpt-oss converter keys
+        try:
+            for module in self.transformer.layers:
+                if hasattr(module.mlp, 'fc'):
+                    module.mlp.fc.tllm_to_externel_key_dict = {
+                        "weight": ["mlp.fc.weight", "mlp.fc.blocks"],
+                        "weights_block_scaling_factor":
+                        "mlp.fc.weights_block_scaling_factor",
+                        "weights_block_scaling_factor_interleaved":
+                        "mlp.fc.weights_block_scaling_factor_interleaved",
+                        "activation_global_scaling_factor":
+                        "mlp.fc.activation_global_scaling_factor",
+                        "alpha": "mlp.fc.alpha",
+                        "bias": "mlp.fc.bias",
+                    }
+                if hasattr(module.mlp, 'proj'):
+                    module.mlp.proj.tllm_to_externel_key_dict = {
+                        "weight": ["mlp.proj.weight", "mlp.proj.blocks"],
+                        "weights_block_scaling_factor":
+                        "mlp.proj.weights_block_scaling_factor",
+                        "weights_block_scaling_factor_interleaved":
+                        "mlp.proj.weights_block_scaling_factor_interleaved",
+                        "activation_global_scaling_factor":
+                        "mlp.proj.activation_global_scaling_factor",
+                        "alpha": "mlp.proj.alpha",
+                        "bias": "mlp.proj.bias",
+                    }
+                if hasattr(module.mlp, 'router'):
+                    module.mlp.router.tllm_to_externel_key_dict = {
+                        "mlp": "mlp",
+                        "router": "mlp.router"
+                    }
+        except Exception:
+            pass
+
     @classmethod
     def from_hugging_face(
         cls,

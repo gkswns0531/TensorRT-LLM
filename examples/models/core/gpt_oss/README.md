@@ -1,3 +1,37 @@
+# GPT-OSS on TensorRT-LLM (WIP)
+
+## Convert (HF or original)
+
+```bash
+python examples/models/core/gpt_oss/convert_checkpoint.py \
+  --model_dir /path/to/gpt-oss-hf-or-original \
+  --output_dir /path/to/tllm_ckpt \
+  --dtype bfloat16
+```
+
+## Build (TensorRT backend)
+
+```bash
+trtllm-build \
+  --checkpoint_dir /path/to/tllm_ckpt \
+  --output_dir /path/to/engine \
+  --max_batch_size 4 \
+  --max_input_len 4096 \
+  --max_seq_len 4096 \
+  --kv_cache_type paged
+```
+
+## Serve
+
+```bash
+trtllm-serve /path/to/engine --backend tensorrt --tp_size 1 --ep_size 1
+```
+
+Notes:
+- MoE weights: converter emits both BF16(`mlp.fc/proj.weight`) and MXFP4 (`blocks/scales` + NVFP4 auxiliary scales) keys.
+- Attention sinks: wired as optional; can be disabled if needed.
+- Long context: adjust `max_seq_len` and KV cache settings.
+
 # GPT-OSS
 
 ## Overview
