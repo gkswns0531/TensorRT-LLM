@@ -143,3 +143,19 @@ moe_config:
 ```bash
 --moe_backend TRITON
 ```
+
+## Convert & Prepare TensorRT-LLM Checkpoint (WIP)
+
+This repository contains a work-in-progress TensorRT backend path for GPT-OSS.
+You can export a TensorRT-LLM checkpoint config (and minimal shards) with:
+
+```bash
+python convert_checkpoint.py \
+  --model_dir /path/to/gpt-oss-20b \
+  --output_dir /tmp/gpt_oss_ckpt \
+  --dtype bfloat16
+```
+
+Notes:
+- Current converter loads sinks, Q/K/V/O, norms, embeddings, lm_head, and MoE MXFP4 raw tensors.
+- TP=1 only at this stage. TP>1, MoE full mapping, and engine build will be enabled in subsequent commits.
