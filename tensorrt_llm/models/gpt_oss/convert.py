@@ -69,14 +69,35 @@ def convert_and_save(
     # Save config.json (already handled by caller typically)
     config.to_json_file(str(output / 'config.json'))
 
-    # Create minimal rank shards to allow plumbing tests
+    # Prepare minimal shards and try to import attention sinks
     world_size = config.mapping.world_size if config.mapping else 1
+    sinks_per_layer = {}
+    try:
+        sinks_per_layer = _extract_sinks_from_index(p_model)
+        logger.info(f"Loaded sinks for {len(sinks_per_layer)} layers")
+    except Exception as e:
+        logger.warning(f"Failed to load sinks (optional): {e}")
+
     for rank in range(world_size):
         shard_path = output / f'rank{rank}.safetensors'
-        if shard_path.exists():
-            continue
-        safetensors.torch.save_file({}, str(shard_path))
-        logger.info(f"Created placeholder shard: {shard_path}")
+        weights: Dict[str, torch.Tensor] = {}
+
+        # Distribute sinks across TP ranks
+        if sinks_per_layer:
+            tp_size = config.mapping.tp_size if config.mapping else 1
+            num_heads = config.num_attention_heads
+            heads_per_rank = num_heads // tp_size if tp_size > 0 else num_heads
+
+            for layer_idx, sinks in sinks_per_layer.items():
+                # sinks shape: [num_heads]
+                beg = rank * heads_per_rank
+                end = beg + heads_per_rank
+                tp_sinks = sinks[beg:end].contiguous().to(torch.float32)
+                key = f"transformer.layers.{layer_idx}.attention.sinks"
+                weights[key] = tp_sinks
+
+        safetensors.torch.save_file(weights, str(shard_path))
+        logger.info(f"Wrote shard with {len(weights)} tensors: {shard_path}")
 
     logger.warning(
         "convert_and_save: Placeholder shards created. Full weight conversion will be implemented next (QKV/GQA/TP, MoE MXFP4, sinks)."
@@ -105,4 +126,45 @@ def _load_attention_sinks(hf_model_or_dir: Union[str, Path], num_layers: int, nu
                           mapping: Mapping) -> Dict[int, torch.Tensor]:
     """TODO: Load per-layer sinks (float32 per head) and TP-slice them."""
     raise NotImplementedError
+
+
+def _extract_sinks_from_index(model_dir: Path) -> Dict[int, torch.Tensor]:
+    """
+    Parse HF safetensors index and extract per-layer self_attn.sinks tensors.
+    Returns: dict[layer_idx] = 1D float tensor of length num_heads.
+    """
+    index_path = model_dir / 'model.safetensors.index.json'
+    with open(index_path, 'r') as f:
+        idx = json.load(f)  # type: ignore
+    weight_map: Dict[str, str] = idx['weight_map']
+
+    # group keys per layer
+    sinks: Dict[int, torch.Tensor] = {}
+    cache_files: Dict[str, Dict[str, torch.Tensor]] = {}
+
+    def load_file(file_name: str) -> Dict[str, torch.Tensor]:
+        if file_name in cache_files:
+            return cache_files[file_name]
+        data_path = model_dir / file_name
+        tensors = safetensors.torch.load_file(str(data_path))
+        cache_files[file_name] = tensors
+        return tensors
+
+    for key, file_name in weight_map.items():
+        # interested in keys like: model.layers.{i}.self_attn.sinks
+        if not key.endswith('.self_attn.sinks'):
+            continue
+        try:
+            parts = key.split('.')
+            # ['model','layers','{i}','self_attn','sinks']
+            layer_idx = int(parts[2])
+        except Exception:
+            continue
+        tensors = load_file(file_name)
+        if key not in tensors:
+            continue
+        t = tensors[key].to(torch.float32).cpu()
+        sinks[layer_idx] = t
+
+    return sinks
 
