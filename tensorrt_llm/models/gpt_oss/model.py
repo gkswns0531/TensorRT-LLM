@@ -4,7 +4,7 @@ import torch
 
 from ...functional import LayerNormType
 from ...layers import (Attention, AttentionMaskType, ColumnLinear, Embedding,
-                       GatedMLP, RmsNorm)
+                       GatedMLP, RmsNorm, MOE)
 from ...module import Module
 from ..modeling_utils import DecoderLayerList, DecoderModelForCausalLM
 from .config import GptOssConfig
@@ -52,15 +52,24 @@ class _GptOssDecoderLayer(Module):
             attention_window_size=sliding_window,
         )
 
-        # For initial milestone, use GatedMLP; MoE wiring will be added later.
-        self.mlp = GatedMLP(hidden_size=config.hidden_size,
-                            ffn_hidden_size=config.intermediate_size,
-                            hidden_act=config.hidden_act,
-                            dtype=dtype,
-                            bias=True,
-                            tp_group=config.mapping.tp_group,
-                            tp_size=config.mapping.tp_size,
-                            quant_mode=config.quant_mode)
+        # Prefer MOE when configured; fallback to GatedMLP otherwise
+        if getattr(config, 'moe', None) and config.moe.num_experts > 0:
+            self.mlp = MOE(moe_config=config.moe,
+                           hidden_size=config.hidden_size,
+                           ffn_hidden_size=config.intermediate_size,
+                           hidden_act=config.hidden_act,
+                           bias=True,
+                           dtype=dtype,
+                           quant_mode=config.quant_mode)
+        else:
+            self.mlp = GatedMLP(hidden_size=config.hidden_size,
+                                ffn_hidden_size=config.intermediate_size,
+                                hidden_act=config.hidden_act,
+                                dtype=dtype,
+                                bias=True,
+                                tp_group=config.mapping.tp_group,
+                                tp_size=config.mapping.tp_size,
+                                quant_mode=config.quant_mode)
 
         self.post_layernorm = RmsNorm(normalized_shape=config.hidden_size,
                                       eps=config.norm_epsilon,
