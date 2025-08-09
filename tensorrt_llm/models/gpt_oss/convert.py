@@ -189,9 +189,8 @@ def convert_and_save(
                         # dense is row-parallel in many models; split columns for output gathering
                         tp_w = torch.chunk(o_w, tp_size, dim=1)[rank].contiguous()
                         weights[f'transformer.layers.{i}.attention.dense.weight'] = tp_w
-                        # bias kept per-rank only if model expects; keep full bias only on rank0 for now
-                        if rank == 0:
-                            weights[f'transformer.layers.{i}.attention.dense.bias'] = o_b.contiguous()
+                        # Write bias on all ranks; non-zero ranks will be zeroed in preprocess
+                        weights[f'transformer.layers.{i}.attention.dense.bias'] = o_b.contiguous()
                 except Exception as e:
                     logger.warning(f"layer {i}: skipping o_proj ({e})")
 
@@ -250,13 +249,13 @@ def convert_and_save(
                         weights[f'transformer.layers.{i}.mlp.proj.scales'] = proj_scales
                         weights[f'transformer.layers.{i}.mlp.proj.bias'] = down_bias.contiguous()
                     else:
-                        # Split along input axis (last dim) for blocks/scales and bias along last dim
+                        # Split along input axis (last dim) for blocks/scales
                         proj_blocks_tp = torch.chunk(proj_blocks, tp_size, dim=-1)[rank].contiguous()
                         proj_scales_tp = torch.chunk(proj_scales, tp_size, dim=-1)[rank].contiguous()
-                        proj_bias_tp = torch.chunk(down_bias, tp_size, dim=-1)[rank].contiguous()
                         weights[f'transformer.layers.{i}.mlp.proj.blocks'] = proj_blocks_tp
                         weights[f'transformer.layers.{i}.mlp.proj.scales'] = proj_scales_tp
-                        weights[f'transformer.layers.{i}.mlp.proj.bias'] = proj_bias_tp
+                        # Record full bias on all ranks; non-zero ranks will be zeroed in preprocess
+                        weights[f'transformer.layers.{i}.mlp.proj.bias'] = down_bias.contiguous()
                 except Exception as e:
                     logger.info(f"layer {i}: down_proj not found ({e})")
 
