@@ -66,11 +66,11 @@ class _GptOssDecoderLayer(Module):
                                       eps=config.norm_epsilon,
                                       dtype=dtype)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, *, attention_sinks: Optional[torch.Tensor] = None) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
-        attn_out = self.attention(hidden_states)
+        attn_out = self.attention(hidden_states, attention_sinks=attention_sinks)
         hidden_states = residual + attn_out
 
         residual = hidden_states
@@ -99,7 +99,14 @@ class _GptOssModel(Module):
         if self.mapping.is_first_pp_rank():
             hidden_states = self.vocab_embedding(input_ids)
 
-        hidden_states = self.layers.forward(hidden_states)
+        # Pass sinks per layer if provided via kwargs
+        sinks_dict: Optional[dict] = kwargs.get('attention_sinks_dict')
+        if sinks_dict is None:
+            hidden_states = self.layers.forward(hidden_states)
+        else:
+            for idx, layer in enumerate(self.layers):
+                sinks = sinks_dict.get(idx) if isinstance(sinks_dict, dict) else None
+                hidden_states = layer(hidden_states, attention_sinks=sinks)
         return hidden_states
 
 
