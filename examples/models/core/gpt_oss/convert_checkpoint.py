@@ -5,6 +5,7 @@ from pathlib import Path
 
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.gpt_oss.config import GptOssConfig
+from tensorrt_llm.models.gpt_oss.convert import convert_and_save
 
 
 def parse_arguments():
@@ -41,9 +42,9 @@ def main():
                                              mapping=None, quant_config=None,
                                              trust_remote_code=True)
 
-    # Save TRT-LLM checkpoint config only for now (weights conversion added later)
-    cfg.to_json_file(str(output_dir / 'config.json'))
-    logger.info(f'Saved TensorRT-LLM checkpoint config to {output_dir}/config.json')
+    # Save config and placeholder shards (full conversion will be added incrementally)
+    convert_and_save(model_dir, output_dir, cfg)
+    logger.info(f'Prepared TensorRT-LLM checkpoint at {output_dir}')
 
 
 if __name__ == '__main__':
