@@ -223,6 +223,8 @@ def convert_and_save(
                     fc_bias = torch.cat([gate_b, up_b], dim=-1).contiguous()
 
                     if tp_size == 1:
+                        # Quantized path: provide weight tensor from blocks for MOE
+                        weights[f'transformer.layers.{i}.mlp.fc.weight'] = fc_blocks
                         weights[f'transformer.layers.{i}.mlp.fc.blocks'] = fc_blocks
                         weights[f'transformer.layers.{i}.mlp.fc.scales'] = fc_scales
                         weights[f'transformer.layers.{i}.mlp.fc.bias'] = fc_bias
@@ -242,6 +244,7 @@ def convert_and_save(
                         fc_blocks_tp = torch.chunk(fc_blocks, tp_size, dim=-2)[rank].contiguous()
                         fc_scales_tp = torch.chunk(fc_scales, tp_size, dim=-2)[rank].contiguous()
                         fc_bias_tp = torch.chunk(fc_bias, tp_size, dim=-1)[rank].contiguous()
+                        weights[f'transformer.layers.{i}.mlp.fc.weight'] = fc_blocks_tp
                         weights[f'transformer.layers.{i}.mlp.fc.blocks'] = fc_blocks_tp
                         weights[f'transformer.layers.{i}.mlp.fc.scales'] = fc_scales_tp
                         weights[f'transformer.layers.{i}.mlp.fc.bias'] = fc_bias_tp
@@ -266,6 +269,7 @@ def convert_and_save(
                     proj_scales = down_scales.flatten(-2, -1).contiguous()
 
                     if tp_size == 1:
+                        weights[f'transformer.layers.{i}.mlp.proj.weight'] = proj_blocks
                         weights[f'transformer.layers.{i}.mlp.proj.blocks'] = proj_blocks
                         weights[f'transformer.layers.{i}.mlp.proj.scales'] = proj_scales
                         weights[f'transformer.layers.{i}.mlp.proj.bias'] = down_bias.contiguous()
@@ -283,6 +287,7 @@ def convert_and_save(
                         # Split along input axis (last dim) for blocks/scales
                         proj_blocks_tp = torch.chunk(proj_blocks, tp_size, dim=-1)[rank].contiguous()
                         proj_scales_tp = torch.chunk(proj_scales, tp_size, dim=-1)[rank].contiguous()
+                        weights[f'transformer.layers.{i}.mlp.proj.weight'] = proj_blocks_tp
                         weights[f'transformer.layers.{i}.mlp.proj.blocks'] = proj_blocks_tp
                         weights[f'transformer.layers.{i}.mlp.proj.scales'] = proj_scales_tp
                         # Record full bias on all ranks; non-zero ranks will be zeroed in preprocess
