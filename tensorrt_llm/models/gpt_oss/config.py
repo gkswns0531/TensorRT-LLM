@@ -15,7 +15,7 @@ class GptOssConfig(PretrainedConfig):
         rope_theta: float = 150000.0,
         rope_scaling: Optional[Dict[str, Any]] = None,
         initial_context_length: Optional[int] = None,
-        num_experts: Optional[int] = None,
+        moe: Optional[Union[MoeConfig, Dict[str, Any]]] = None,
         experts_per_token: int = 4,
         sliding_window: Optional[int] = None,
         hidden_act: str = "silu",
@@ -27,16 +27,14 @@ class GptOssConfig(PretrainedConfig):
         self.rope_theta = rope_theta
         self.rope_scaling = rope_scaling or {}
         self.initial_context_length = initial_context_length
-        self.num_experts = num_experts
         self.experts_per_token = experts_per_token
         self.sliding_window = sliding_window
         self.hidden_act = hidden_act
 
-        # Build MoE config
-        if self.num_experts and self.num_experts > 0:
-            moe = MoeConfig(num_experts=self.num_experts,
-                            top_k=self.experts_per_token)
-        else:
+        # Build MoE config (coerce dict to MoeConfig)
+        if isinstance(moe, dict):
+            moe = MoeConfig.from_dict(moe)
+        if moe is None:
             moe = MoeConfig(num_experts=0, top_k=0)
         self.moe = moe.validate()
 
@@ -69,6 +67,10 @@ class GptOssConfig(PretrainedConfig):
         initial_context_length = getattr(hf, "initial_context_length", None)
 
         # Build
+        moe_cfg = None
+        if num_experts is not None and num_experts > 0:
+            moe_cfg = MoeConfig(num_experts=num_experts, top_k=experts_per_token).validate()
+
         return cls(
             architecture=getattr(hf, "architectures", [""])[0],
             dtype=dtype,
@@ -93,7 +95,7 @@ class GptOssConfig(PretrainedConfig):
             rope_theta=getattr(hf, "rope_theta", 150000.0),
             rope_scaling=rope_scaling,
             initial_context_length=initial_context_length,
-            num_experts=num_experts,
+            moe=moe_cfg,
             experts_per_token=experts_per_token,
             sliding_window=getattr(hf, "sliding_window", None),
             hidden_act=getattr(hf, "hidden_act", "silu"),
@@ -121,6 +123,10 @@ class GptOssConfig(PretrainedConfig):
             "rope_type": "yarn",
         }
 
+        moe_cfg = None
+        if num_experts is not None and num_experts > 0:
+            moe_cfg = MoeConfig(num_experts=num_experts, top_k=experts_per_token).validate()
+
         return cls(
             architecture="GptOssForCausalLM",
             dtype=dtype,
@@ -145,7 +151,7 @@ class GptOssConfig(PretrainedConfig):
             rope_theta=rope_theta,
             rope_scaling=rope_scaling,
             initial_context_length=original_config.get("initial_context_length", 4096),
-            num_experts=num_experts,
+            moe=moe_cfg,
             experts_per_token=experts_per_token,
             sliding_window=original_config.get("sliding_window", None),
             hidden_act="silu",
@@ -153,25 +159,8 @@ class GptOssConfig(PretrainedConfig):
         )
 
     def to_dict(self):
-        """Override to handle MoeConfig serialization"""
         output = super().to_dict()
-        
-        # Handle MoeConfig object - convert to dict if present
-        if hasattr(self, 'moe') and self.moe is not None:
-            if hasattr(self.moe, 'to_dict'):
-                output['moe'] = self.moe.to_dict()
-            elif hasattr(self.moe, '__dict__'):
-                output['moe'] = {k: v for k, v in self.moe.__dict__.items() 
-                               if not k.startswith('_')}
-            else:
-                # Fallback: try to convert MoeConfig attributes manually
-                moe_dict = {}
-                for attr in ['num_experts', 'top_k', 'capacity_factor', 'router_aux_loss_coef']:
-                    if hasattr(self.moe, attr):
-                        moe_dict[attr] = getattr(self.moe, attr)
-                if moe_dict:
-                    output['moe'] = moe_dict
-        
+        output['moe'] = self.moe.to_dict()
         return output
 
 

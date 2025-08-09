@@ -157,6 +157,55 @@ def convert_and_save(
         a = torch.ones((E, ), dtype=torch.float32)
         return sf_fp8, inter, act_gsf, a
 
+    def _dequantize_mxfp4(blocks: torch.Tensor,
+                          scales: torch.Tensor,
+                          *,
+                          vec: int = 16,
+                          dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
+        """
+        Approximate dequantization of MXFP4 blocks+scales into BF16/FP16.
+
+        Notes:
+        - This is an initial implementation intended for non-Blackwell GPUs (e.g., L4) where FP4 plugin is unavailable.
+        - It assumes blocks pack two 4-bit values per byte and uses a simple symmetric mapping [-8..7].
+        - UE8 scales are normalized to [0,1] by /255. This is a heuristic and should be replaced by the exact mapping
+          when the official MXFP4 decode is available in this environment.
+        - shapes: blocks/scales [E, out, in/vec]. Output shape: [E, out, in].
+        """
+        E, out_rows, in_cols = blocks.shape
+        in_features = in_cols * vec
+
+        # Unpack nibbles: low and high 4 bits
+        if blocks.dtype != torch.uint8:
+            blk = blocks.view(torch.uint8)
+        else:
+            blk = blocks
+        low = (blk & 0x0F).to(torch.int8)
+        high = ((blk >> 4) & 0x0F).to(torch.int8)
+        # Map to signed range [-8, 7]
+        low = (low ^ 0x08) - 0x08
+        high = (high ^ 0x08) - 0x08
+        # Interleave along last axis to reach vec granularity
+        # [E, out, in_cols] -> [E, out, in_cols, 2] -> reshape [E, out, in_features]
+        packed = torch.stack([low, high], dim=-1)
+        packed = packed.view(E, out_rows, in_cols * 2)
+        if vec != 2:
+            # Repeat to reach vec granularity (heuristic spread)
+            rep = vec // 2
+            packed = packed.repeat_interleave(rep, dim=-1)
+
+        # Heuristic scale normalization
+        if scales.dtype != torch.float32 and scales.dtype != torch.float16 and scales.dtype != torch.bfloat16:
+            sf = scales.to(torch.float32) / 255.0
+        else:
+            sf = scales.to(torch.float32)
+        # Broadcast scales to element-wise
+        sf = sf.unsqueeze(-1).repeat(1, 1, vec)  # [E, out, in_cols*vec]
+        sf = sf.view(E, out_rows, in_features)
+
+        deq = (packed.to(torch.float32) * sf).to(dtype)
+        return deq
+
     for rank in range(world_size):
         shard_path = output / f'rank{rank}.safetensors'
         weights: Dict[str, torch.Tensor] = {}
@@ -279,8 +328,9 @@ def convert_and_save(
                     fc_bias = torch.cat([gate_b, up_b], dim=-1).contiguous()
 
                     if tp_size == 1:
-                        # Quantized path: provide weight tensor from blocks for MOE
-                        weights[f'transformer.layers.{i}.mlp.fc.weight'] = fc_blocks
+                        # Dequantize MXFP4 to BF16/FP16 for non-Blackwell GPUs
+                        fc_weight = _dequantize_mxfp4(fc_blocks, fc_scales, dtype=torch.bfloat16)
+                        weights[f'transformer.layers.{i}.mlp.fc.weight'] = fc_weight.contiguous()
                         weights[f'transformer.layers.{i}.mlp.fc.blocks'] = fc_blocks
                         weights[f'transformer.layers.{i}.mlp.fc.scales'] = fc_scales
                         weights[f'transformer.layers.{i}.mlp.fc.bias'] = fc_bias
@@ -299,7 +349,8 @@ def convert_and_save(
                         fc_blocks_tp = torch.chunk(fc_blocks, tp_size, dim=-2)[rank].contiguous()
                         fc_scales_tp = torch.chunk(fc_scales, tp_size, dim=-2)[rank].contiguous()
                         fc_bias_tp = torch.chunk(fc_bias, tp_size, dim=-1)[rank].contiguous()
-                        weights[f'transformer.layers.{i}.mlp.fc.weight'] = fc_blocks_tp
+                        fc_weight_tp = _dequantize_mxfp4(fc_blocks_tp, fc_scales_tp, dtype=torch.bfloat16)
+                        weights[f'transformer.layers.{i}.mlp.fc.weight'] = fc_weight_tp.contiguous()
                         weights[f'transformer.layers.{i}.mlp.fc.blocks'] = fc_blocks_tp
                         weights[f'transformer.layers.{i}.mlp.fc.scales'] = fc_scales_tp
                         weights[f'transformer.layers.{i}.mlp.fc.bias'] = fc_bias_tp
@@ -323,7 +374,8 @@ def convert_and_save(
                     proj_scales = down_scales.flatten(-2, -1).contiguous()
 
                     if tp_size == 1:
-                        weights[f'transformer.layers.{i}.mlp.proj.weight'] = proj_blocks
+                        proj_weight = _dequantize_mxfp4(proj_blocks, proj_scales, dtype=torch.bfloat16)
+                        weights[f'transformer.layers.{i}.mlp.proj.weight'] = proj_weight.contiguous()
                         weights[f'transformer.layers.{i}.mlp.proj.blocks'] = proj_blocks
                         weights[f'transformer.layers.{i}.mlp.proj.scales'] = proj_scales
                         weights[f'transformer.layers.{i}.mlp.proj.bias'] = down_bias.contiguous()
@@ -340,7 +392,8 @@ def convert_and_save(
                         # Split along input axis (last dim) for blocks/scales
                         proj_blocks_tp = torch.chunk(proj_blocks, tp_size, dim=-1)[rank].contiguous()
                         proj_scales_tp = torch.chunk(proj_scales, tp_size, dim=-1)[rank].contiguous()
-                        weights[f'transformer.layers.{i}.mlp.proj.weight'] = proj_blocks_tp
+                        proj_weight_tp = _dequantize_mxfp4(proj_blocks_tp, proj_scales_tp, dtype=torch.bfloat16)
+                        weights[f'transformer.layers.{i}.mlp.proj.weight'] = proj_weight_tp.contiguous()
                         weights[f'transformer.layers.{i}.mlp.proj.blocks'] = proj_blocks_tp
                         weights[f'transformer.layers.{i}.mlp.proj.scales'] = proj_scales_tp
                         # Record full bias on all ranks; non-zero ranks will be zeroed in preprocess

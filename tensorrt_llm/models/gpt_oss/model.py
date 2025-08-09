@@ -4,7 +4,7 @@ import torch
 
 from tensorrt_llm.functional import LayerNormType
 from tensorrt_llm.layers import (Attention, AttentionMaskType, ColumnLinear, Embedding,
-                         GatedMLP, RmsNorm, MOE)
+                         GatedMLP, RmsNorm, MOE, MoeConfig)
 from tensorrt_llm.parameter import Parameter
 from tensorrt_llm.module import Module
 from tensorrt_llm.models.modeling_utils import DecoderLayerList, DecoderModelForCausalLM
@@ -59,8 +59,14 @@ class _GptOssDecoderLayer(Module):
             pass
 
         # Prefer MOE when configured; fallback to GatedMLP otherwise
-        if getattr(config, 'moe', None) and config.moe.num_experts > 0:
-            self.mlp = MOE(moe_config=config.moe,
+        moe_cfg = getattr(config, 'moe', None)
+        if isinstance(moe_cfg, dict):
+            try:
+                moe_cfg = MoeConfig.from_dict(moe_cfg)
+            except Exception:
+                moe_cfg = None
+        if moe_cfg and getattr(moe_cfg, 'num_experts', 0) > 0:
+            self.mlp = MOE(moe_config=moe_cfg,
                            hidden_size=config.hidden_size,
                            ffn_hidden_size=config.intermediate_size,
                            hidden_act=config.hidden_act,
