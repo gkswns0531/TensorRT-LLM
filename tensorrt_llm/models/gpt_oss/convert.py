@@ -13,6 +13,7 @@ will be implemented incrementally, following existing model patterns.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Union
 
@@ -78,6 +79,28 @@ def convert_and_save(
     except Exception as e:
         logger.warning(f"Failed to load sinks (optional): {e}")
 
+    # Load HF weight_map for QKV/Norm/Embeddings/lm_head
+    weight_map = None
+    try:
+        with open(p_model / 'model.safetensors.index.json', 'r') as f:
+            idx = json.load(f)
+        weight_map = idx['weight_map']
+    except Exception as e:
+        logger.warning(f"Index not found or unreadable, skipping weights: {e}")
+
+    cache_files: Dict[str, Dict[str, torch.Tensor]] = {}
+
+    def load_file(file_name: str) -> Dict[str, torch.Tensor]:
+        if file_name in cache_files:
+            return cache_files[file_name]
+        data_path = p_model / file_name
+        tensors = safetensors.torch.load_file(str(data_path))
+        cache_files[file_name] = tensors
+        return tensors
+
+    tp_size = config.mapping.tp_size if config.mapping else 1
+    assert tp_size == 1, "Initial converter supports TP=1 only; implement TP split in a later step."
+
     for rank in range(world_size):
         shard_path = output / f'rank{rank}.safetensors'
         weights: Dict[str, torch.Tensor] = {}
@@ -95,6 +118,69 @@ def convert_and_save(
                 tp_sinks = sinks[beg:end].contiguous().to(torch.float32)
                 key = f"transformer.layers.{layer_idx}.attention.sinks"
                 weights[key] = tp_sinks
+
+        # Extract attention/projection/ln/emb/lm_head when index exists
+        if weight_map is not None and rank == 0:
+            nl = config.num_hidden_layers
+            # Per-layer
+            for i in range(nl):
+                # q,k,v
+                def get(name: str) -> torch.Tensor:
+                    file = weight_map.get(name)
+                    if file is None:
+                        raise KeyError(name)
+                    tensors = load_file(file)
+                    return tensors[name]
+
+                try:
+                    q_w = get(f'model.layers.{i}.self_attn.q_proj.weight')
+                    k_w = get(f'model.layers.{i}.self_attn.k_proj.weight')
+                    v_w = get(f'model.layers.{i}.self_attn.v_proj.weight')
+                    q_b = get(f'model.layers.{i}.self_attn.q_proj.bias')
+                    k_b = get(f'model.layers.{i}.self_attn.k_proj.bias')
+                    v_b = get(f'model.layers.{i}.self_attn.v_proj.bias')
+                    # Concat along out_dim for weights; biases along dim 0
+                    qkv_w = torch.cat([q_w, k_w, v_w], dim=0).contiguous()
+                    qkv_b = torch.cat([q_b, k_b, v_b], dim=0).contiguous()
+                    weights[f'transformer.layers.{i}.attention.qkv.weight'] = qkv_w
+                    weights[f'transformer.layers.{i}.attention.qkv.bias'] = qkv_b
+                except Exception as e:
+                    logger.warning(f"layer {i}: skipping qkv ({e})")
+
+                try:
+                    o_w = get(f'model.layers.{i}.self_attn.o_proj.weight')
+                    o_b = get(f'model.layers.{i}.self_attn.o_proj.bias')
+                    weights[f'transformer.layers.{i}.attention.dense.weight'] = o_w.contiguous()
+                    weights[f'transformer.layers.{i}.attention.dense.bias'] = o_b.contiguous()
+                except Exception as e:
+                    logger.warning(f"layer {i}: skipping o_proj ({e})")
+
+                try:
+                    in_ln = get(f'model.layers.{i}.input_layernorm.weight')
+                    po_ln = get(f'model.layers.{i}.post_attention_layernorm.weight')
+                    weights[f'transformer.layers.{i}.input_layernorm.weight'] = in_ln.contiguous()
+                    weights[f'transformer.layers.{i}.post_layernorm.weight'] = po_ln.contiguous()
+                except Exception as e:
+                    logger.warning(f"layer {i}: skipping norms ({e})")
+
+            # Embeddings & final norm & lm_head
+            try:
+                emb_w = get('model.embed_tokens.weight')
+                weights['transformer.vocab_embedding.weight'] = emb_w.contiguous()
+            except Exception as e:
+                logger.warning(f"embed skip: {e}")
+
+            try:
+                ln_f = get('model.norm.weight')
+                weights['transformer.ln_f.weight'] = ln_f.contiguous()
+            except Exception as e:
+                logger.warning(f"ln_f skip: {e}")
+
+            try:
+                lm_w = get('lm_head.weight')
+                weights['lm_head.weight'] = lm_w.contiguous()
+            except Exception as e:
+                logger.warning(f"lm_head skip: {e}")
 
         safetensors.torch.save_file(weights, str(shard_path))
         logger.info(f"Wrote shard with {len(weights)} tensors: {shard_path}")
