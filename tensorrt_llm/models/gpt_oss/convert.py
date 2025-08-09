@@ -163,6 +163,27 @@ def convert_and_save(
                 except Exception as e:
                     logger.warning(f"layer {i}: skipping norms ({e})")
 
+                # MoE (raw MXFP4) passthrough for later consumption
+                try:
+                    gate_up_blocks = get(f'model.layers.{i}.mlp.experts.gate_up_proj_blocks')
+                    gate_up_scales = get(f'model.layers.{i}.mlp.experts.gate_up_proj_scales')
+                    gate_up_bias = get(f'model.layers.{i}.mlp.experts.gate_up_proj_bias')
+                    weights[f'transformer.layers.{i}.mlp.experts.gate_up_proj.blocks'] = gate_up_blocks.contiguous()
+                    weights[f'transformer.layers.{i}.mlp.experts.gate_up_proj.scales'] = gate_up_scales.contiguous()
+                    weights[f'transformer.layers.{i}.mlp.experts.gate_up_proj.bias'] = gate_up_bias.contiguous()
+                except Exception as e:
+                    logger.info(f"layer {i}: gate_up_proj not found ({e})")
+
+                try:
+                    down_blocks = get(f'model.layers.{i}.mlp.experts.down_proj_blocks')
+                    down_scales = get(f'model.layers.{i}.mlp.experts.down_proj_scales')
+                    down_bias = get(f'model.layers.{i}.mlp.experts.down_proj_bias')
+                    weights[f'transformer.layers.{i}.mlp.experts.down_proj.blocks'] = down_blocks.contiguous()
+                    weights[f'transformer.layers.{i}.mlp.experts.down_proj.scales'] = down_scales.contiguous()
+                    weights[f'transformer.layers.{i}.mlp.experts.down_proj.bias'] = down_bias.contiguous()
+                except Exception as e:
+                    logger.info(f"layer {i}: down_proj not found ({e})")
+
             # Embeddings & final norm & lm_head
             try:
                 emb_w = get('model.embed_tokens.weight')
