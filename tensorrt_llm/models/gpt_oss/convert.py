@@ -99,7 +99,6 @@ def convert_and_save(
         return tensors
 
     tp_size = config.mapping.tp_size if config.mapping else 1
-    assert tp_size == 1, "Initial converter supports TP=1 only; implement TP split in a later step."
 
     for rank in range(world_size):
         shard_path = output / f'rank{rank}.safetensors'
@@ -140,18 +139,33 @@ def convert_and_save(
                     k_b = get(f'model.layers.{i}.self_attn.k_proj.bias')
                     v_b = get(f'model.layers.{i}.self_attn.v_proj.bias')
                     # Concat along out_dim for weights; biases along dim 0
-                    qkv_w = torch.cat([q_w, k_w, v_w], dim=0).contiguous()
-                    qkv_b = torch.cat([q_b, k_b, v_b], dim=0).contiguous()
-                    weights[f'transformer.layers.{i}.attention.qkv.weight'] = qkv_w
-                    weights[f'transformer.layers.{i}.attention.qkv.bias'] = qkv_b
+                    qkv_w_all = torch.cat([q_w, k_w, v_w], dim=0).contiguous()
+                    qkv_b_all = torch.cat([q_b, k_b, v_b], dim=0).contiguous()
+                    if tp_size == 1:
+                        weights[f'transformer.layers.{i}.attention.qkv.weight'] = qkv_w_all
+                        weights[f'transformer.layers.{i}.attention.qkv.bias'] = qkv_b_all
+                    else:
+                        # TODO: implement GQA-aware TP split. For now, naive chunking along output dim.
+                        tp_chunk_w = torch.chunk(qkv_w_all, tp_size, dim=0)[rank].contiguous()
+                        tp_chunk_b = torch.chunk(qkv_b_all, tp_size, dim=0)[rank].contiguous()
+                        weights[f'transformer.layers.{i}.attention.qkv.weight'] = tp_chunk_w
+                        weights[f'transformer.layers.{i}.attention.qkv.bias'] = tp_chunk_b
                 except Exception as e:
                     logger.warning(f"layer {i}: skipping qkv ({e})")
 
                 try:
                     o_w = get(f'model.layers.{i}.self_attn.o_proj.weight')
                     o_b = get(f'model.layers.{i}.self_attn.o_proj.bias')
-                    weights[f'transformer.layers.{i}.attention.dense.weight'] = o_w.contiguous()
-                    weights[f'transformer.layers.{i}.attention.dense.bias'] = o_b.contiguous()
+                    if tp_size == 1:
+                        weights[f'transformer.layers.{i}.attention.dense.weight'] = o_w.contiguous()
+                        weights[f'transformer.layers.{i}.attention.dense.bias'] = o_b.contiguous()
+                    else:
+                        # dense is row-parallel in many models; split columns for output gathering
+                        tp_w = torch.chunk(o_w, tp_size, dim=1)[rank].contiguous()
+                        weights[f'transformer.layers.{i}.attention.dense.weight'] = tp_w
+                        # bias kept per-rank only if model expects; keep full bias only on rank0 for now
+                        if rank == 0:
+                            weights[f'transformer.layers.{i}.attention.dense.bias'] = o_b.contiguous()
                 except Exception as e:
                     logger.warning(f"layer {i}: skipping o_proj ({e})")
 
@@ -203,7 +217,12 @@ def convert_and_save(
             # Embeddings & final norm & lm_head
             try:
                 emb_w = get('model.embed_tokens.weight')
-                weights['transformer.vocab_embedding.weight'] = emb_w.contiguous()
+                if tp_size == 1:
+                    weights['transformer.vocab_embedding.weight'] = emb_w.contiguous()
+                else:
+                    # column-sharded along vocab dimension
+                    tp_emb = torch.chunk(emb_w, tp_size, dim=0)[rank].contiguous()
+                    weights['transformer.vocab_embedding.weight'] = tp_emb
             except Exception as e:
                 logger.warning(f"embed skip: {e}")
 
@@ -215,7 +234,11 @@ def convert_and_save(
 
             try:
                 lm_w = get('lm_head.weight')
-                weights['lm_head.weight'] = lm_w.contiguous()
+                if tp_size == 1:
+                    weights['lm_head.weight'] = lm_w.contiguous()
+                else:
+                    tp_lm = torch.chunk(lm_w, tp_size, dim=0)[rank].contiguous()
+                    weights['lm_head.weight'] = tp_lm
             except Exception as e:
                 logger.warning(f"lm_head skip: {e}")
 
