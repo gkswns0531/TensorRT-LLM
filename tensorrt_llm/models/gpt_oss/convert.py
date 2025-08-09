@@ -23,6 +23,7 @@ import torch
 from ...logger import logger
 from ...mapping import Mapping
 from ..modeling_utils import QuantConfig
+from ..convert_utils import split_matrix_tp, dup_kv_weight, dup_kv_bias
 from .config import GptOssConfig
 
 
@@ -138,18 +139,43 @@ def convert_and_save(
                     q_b = get(f'model.layers.{i}.self_attn.q_proj.bias')
                     k_b = get(f'model.layers.{i}.self_attn.k_proj.bias')
                     v_b = get(f'model.layers.{i}.self_attn.v_proj.bias')
-                    # Concat along out_dim for weights; biases along dim 0
-                    qkv_w_all = torch.cat([q_w, k_w, v_w], dim=0).contiguous()
-                    qkv_b_all = torch.cat([q_b, k_b, v_b], dim=0).contiguous()
+
                     if tp_size == 1:
+                        qkv_w_all = torch.cat([q_w, k_w, v_w], dim=0).contiguous()
+                        qkv_b_all = torch.cat([q_b, k_b, v_b], dim=0).contiguous()
                         weights[f'transformer.layers.{i}.attention.qkv.weight'] = qkv_w_all
                         weights[f'transformer.layers.{i}.attention.qkv.bias'] = qkv_b_all
                     else:
-                        # TODO: implement GQA-aware TP split. For now, naive chunking along output dim.
-                        tp_chunk_w = torch.chunk(qkv_w_all, tp_size, dim=0)[rank].contiguous()
-                        tp_chunk_b = torch.chunk(qkv_b_all, tp_size, dim=0)[rank].contiguous()
-                        weights[f'transformer.layers.{i}.attention.qkv.weight'] = tp_chunk_w
-                        weights[f'transformer.layers.{i}.attention.qkv.bias'] = tp_chunk_b
+                        # GQA-aware TP split: split Q per num_heads, duplicate KV per num_kv_heads
+                        num_heads = config.num_attention_heads
+                        num_kv_heads = config.num_key_value_heads
+                        head_size = config.head_size
+
+                        # Q rows split evenly across TP ranks
+                        q_w_tp = split_matrix_tp(q_w, tp_size, rank, dim=0)
+                        q_b_tp = split_matrix_tp(q_b, tp_size, rank, dim=0)
+
+                        # Duplicate KV rows if needed so rows % tp_size == 0
+                        k_w_eff = k_w
+                        v_w_eff = v_w
+                        k_b_eff = k_b
+                        v_b_eff = v_b
+                        if (k_w.shape[0] % tp_size) != 0 and num_kv_heads > 0:
+                            k_w_eff = dup_kv_weight(k_w, num_kv_heads, tp_size)
+                            v_w_eff = dup_kv_weight(v_w, num_kv_heads, tp_size)
+                            k_b_eff = dup_kv_bias(k_b, num_kv_heads, tp_size)
+                            v_b_eff = dup_kv_bias(v_b, num_kv_heads, tp_size)
+
+                        k_w_tp = split_matrix_tp(k_w_eff, tp_size, rank, dim=0)
+                        v_w_tp = split_matrix_tp(v_w_eff, tp_size, rank, dim=0)
+                        k_b_tp = split_matrix_tp(k_b_eff, tp_size, rank, dim=0)
+                        v_b_tp = split_matrix_tp(v_b_eff, tp_size, rank, dim=0)
+
+                        qkv_w_tp = torch.cat([q_w_tp, k_w_tp, v_w_tp], dim=0).contiguous()
+                        qkv_b_tp = torch.cat([q_b_tp, k_b_tp, v_b_tp], dim=0).contiguous()
+
+                        weights[f'transformer.layers.{i}.attention.qkv.weight'] = qkv_w_tp
+                        weights[f'transformer.layers.{i}.attention.qkv.bias'] = qkv_b_tp
                 except Exception as e:
                     logger.warning(f"layer {i}: skipping qkv ({e})")
 
