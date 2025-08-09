@@ -215,16 +215,26 @@ def convert_and_save(
                     up_w = gub_flat[:, 1::2, :]
                     gate_sc = gub_sc_flat[:, ::2, :]
                     up_sc = gub_sc_flat[:, 1::2, :]
-                    # Concatenate gate, up along channel axis (following Qwen mapping style)
+                    # Concatenate gate, up along channel axis
                     fc_blocks = torch.cat([gate_w, up_w], dim=-2).contiguous()
                     fc_scales = torch.cat([gate_sc, up_sc], dim=-2).contiguous()
                     # Bias: interleaved pairs gate/up across last dim
                     gate_b = gate_up_bias[:, ::2]
                     up_b = gate_up_bias[:, 1::2]
                     fc_bias = torch.cat([gate_b, up_b], dim=-1).contiguous()
-                    weights[f'transformer.layers.{i}.mlp.fc.blocks'] = fc_blocks
-                    weights[f'transformer.layers.{i}.mlp.fc.scales'] = fc_scales
-                    weights[f'transformer.layers.{i}.mlp.fc.bias'] = fc_bias
+
+                    if tp_size == 1:
+                        weights[f'transformer.layers.{i}.mlp.fc.blocks'] = fc_blocks
+                        weights[f'transformer.layers.{i}.mlp.fc.scales'] = fc_scales
+                        weights[f'transformer.layers.{i}.mlp.fc.bias'] = fc_bias
+                    else:
+                        # Split along output-channel axis (-2) for blocks/scales and along last dim for bias
+                        fc_blocks_tp = torch.chunk(fc_blocks, tp_size, dim=-2)[rank].contiguous()
+                        fc_scales_tp = torch.chunk(fc_scales, tp_size, dim=-2)[rank].contiguous()
+                        fc_bias_tp = torch.chunk(fc_bias, tp_size, dim=-1)[rank].contiguous()
+                        weights[f'transformer.layers.{i}.mlp.fc.blocks'] = fc_blocks_tp
+                        weights[f'transformer.layers.{i}.mlp.fc.scales'] = fc_scales_tp
+                        weights[f'transformer.layers.{i}.mlp.fc.bias'] = fc_bias_tp
                 except Exception as e:
                     logger.info(f"layer {i}: gate_up_proj not found ({e})")
 
@@ -234,9 +244,19 @@ def convert_and_save(
                     down_bias = get(f'model.layers.{i}.mlp.experts.down_proj_bias')
                     proj_blocks = down_blocks.flatten(-2, -1).contiguous()
                     proj_scales = down_scales.flatten(-2, -1).contiguous()
-                    weights[f'transformer.layers.{i}.mlp.proj.blocks'] = proj_blocks
-                    weights[f'transformer.layers.{i}.mlp.proj.scales'] = proj_scales
-                    weights[f'transformer.layers.{i}.mlp.proj.bias'] = down_bias.contiguous()
+
+                    if tp_size == 1:
+                        weights[f'transformer.layers.{i}.mlp.proj.blocks'] = proj_blocks
+                        weights[f'transformer.layers.{i}.mlp.proj.scales'] = proj_scales
+                        weights[f'transformer.layers.{i}.mlp.proj.bias'] = down_bias.contiguous()
+                    else:
+                        # Split along input axis (last dim) for blocks/scales and bias along last dim
+                        proj_blocks_tp = torch.chunk(proj_blocks, tp_size, dim=-1)[rank].contiguous()
+                        proj_scales_tp = torch.chunk(proj_scales, tp_size, dim=-1)[rank].contiguous()
+                        proj_bias_tp = torch.chunk(down_bias, tp_size, dim=-1)[rank].contiguous()
+                        weights[f'transformer.layers.{i}.mlp.proj.blocks'] = proj_blocks_tp
+                        weights[f'transformer.layers.{i}.mlp.proj.scales'] = proj_scales_tp
+                        weights[f'transformer.layers.{i}.mlp.proj.bias'] = proj_bias_tp
                 except Exception as e:
                     logger.info(f"layer {i}: down_proj not found ({e})")
 
