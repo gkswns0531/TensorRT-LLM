@@ -259,6 +259,37 @@ def convert_and_save(
                 except Exception as e:
                     logger.info(f"layer {i}: down_proj not found ({e})")
 
+                # Optional BF16 path: if float weights exist, emit fc/proj.weight for MOE
+                try:
+                    gu_w_f = get(f'model.layers.{i}.mlp.experts.gate_up_proj.weight')
+                    dp_w_f = get(f'model.layers.{i}.mlp.experts.down_proj.weight')
+                    # gate_up float layout: [E, 2*ffn, H] or [2*ffn, H] when shared across experts
+                    # Keep as-is to feed MOE.fc (expects gated 2*ffn)
+                    if gu_w_f.dim() == 3:
+                        fc_w = gu_w_f
+                    else:
+                        # expand to [E, 2*ffn, H] with E=1
+                        fc_w = gu_w_f.unsqueeze(0)
+
+                    if dp_w_f.dim() == 3:
+                        proj_w = dp_w_f
+                    else:
+                        proj_w = dp_w_f.unsqueeze(0)
+
+                    # TP split
+                    if tp_size == 1:
+                        weights[f'transformer.layers.{i}.mlp.fc.weight'] = fc_w.contiguous()
+                        weights[f'transformer.layers.{i}.mlp.proj.weight'] = proj_w.contiguous()
+                    else:
+                        # fc: split along output-channel axis (-2)
+                        fc_w_tp = torch.chunk(fc_w, tp_size, dim=-2)[rank].contiguous()
+                        # proj: split along input axis (-1)
+                        proj_w_tp = torch.chunk(proj_w, tp_size, dim=-1)[rank].contiguous()
+                        weights[f'transformer.layers.{i}.mlp.fc.weight'] = fc_w_tp
+                        weights[f'transformer.layers.{i}.mlp.proj.weight'] = proj_w_tp
+                except Exception:
+                    pass
+
             # Embeddings & final norm & lm_head
             try:
                 emb_w = get('model.embed_tokens.weight')
