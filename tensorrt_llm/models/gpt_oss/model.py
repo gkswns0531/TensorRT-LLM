@@ -5,6 +5,7 @@ import torch
 from ...functional import LayerNormType
 from ...layers import (Attention, AttentionMaskType, ColumnLinear, Embedding,
                        GatedMLP, RmsNorm, MOE)
+from ...parameter import Parameter
 from ...module import Module
 from ..modeling_utils import DecoderLayerList, DecoderModelForCausalLM
 from .config import GptOssConfig
@@ -51,6 +52,12 @@ class _GptOssDecoderLayer(Module):
             layernorm_type=LayerNormType.RmsNorm,
             attention_window_size=sliding_window,
         )
+        # register sinks parameter under attention for weight loading compatibility
+        try:
+            setattr(self.attention, 'sinks', Parameter(shape=(config.num_attention_heads // max(1, config.mapping.tp_size), ),
+                                                       dtype='float32'))
+        except Exception:
+            pass
 
         # Prefer MOE when configured; fallback to GatedMLP otherwise
         if getattr(config, 'moe', None) and config.moe.num_experts > 0:
@@ -79,7 +86,20 @@ class _GptOssDecoderLayer(Module):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
-        attn_out = self.attention(hidden_states, attention_sinks=attention_sinks)
+        # try to pass sinks if attention supports it; otherwise fallback
+        attn_out = None
+        sinks_arg = attention_sinks
+        if sinks_arg is None and hasattr(self.attention, 'sinks'):
+            try:
+                sinks_tensor = getattr(self.attention, 'sinks')
+                # Parameter may carry .value or .data depending on backend; forward raw to attention
+                sinks_arg = getattr(sinks_tensor, 'value', None) or getattr(sinks_tensor, 'data', None) or sinks_tensor
+            except Exception:
+                sinks_arg = None
+        try:
+            attn_out = self.attention(hidden_states, attention_sinks=sinks_arg)
+        except TypeError:
+            attn_out = self.attention(hidden_states)
         hidden_states = residual + attn_out
 
         residual = hidden_states
