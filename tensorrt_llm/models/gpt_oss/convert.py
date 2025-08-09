@@ -120,7 +120,7 @@ def convert_and_save(
                 weights[key] = tp_sinks
 
         # Extract attention/projection/ln/emb/lm_head when index exists
-        if weight_map is not None and rank == 0:
+        if weight_map is not None:
             nl = config.num_hidden_layers
             # Per-layer
             for i in range(nl):
@@ -287,22 +287,22 @@ def convert_and_save(
             except Exception as e:
                 logger.warning(f"lm_head skip: {e}")
 
-            # Router weight (optional; present in MoE)
+        # Router weight (optional; present in MoE) — write on all ranks
+        if weight_map is not None:
             try:
-                router = get('model.layers.0.mlp.router.weight')
-                if router is not None:
-                    # assume shared across layers or per-layer? For HF GPT-OSS router is per-layer; save per-layer if exists
-                    for i in range(nl):
-                        name = f'model.layers.{i}.mlp.router.weight'
-                        file = weight_map.get(name)
-                        if file is None:
-                            continue
-                        tensors = load_file(file)
-                        if name not in tensors:
-                            continue
-                        w = tensors[name]
-                        # router is [num_experts, hidden_size] shape; keep TP=1 for now; TODO: add TP split if required
-                        weights[f'transformer.layers.{i}.mlp.router.weight'] = w.contiguous()
+                # probe existence
+                _ = weight_map.get('model.layers.0.mlp.router.weight')
+                for i in range(config.num_hidden_layers):
+                    name = f'model.layers.{i}.mlp.router.weight'
+                    file = weight_map.get(name)
+                    if file is None:
+                        continue
+                    tensors = load_file(file)
+                    if name not in tensors:
+                        continue
+                    w = tensors[name]
+                    # keep unsplit; MOE handles distribution internally
+                    weights[f'transformer.layers.{i}.mlp.router.weight'] = w.contiguous()
             except Exception as e:
                 logger.info(f"router skip: {e}")
 
