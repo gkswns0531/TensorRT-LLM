@@ -92,6 +92,12 @@ class _GptOssModel(Module):
 
         self.layers = DecoderLayerList(_GptOssDecoderLayer, config)
 
+        # final layer norm
+        if self.mapping.is_last_pp_rank():
+            self.ln_f = RmsNorm(normalized_shape=config.hidden_size,
+                                eps=config.norm_epsilon,
+                                dtype=config.dtype)
+
     def forward(self,
                 input_ids: torch.Tensor,
                 hidden_states: Optional[torch.Tensor] = None,
@@ -107,6 +113,9 @@ class _GptOssModel(Module):
             for idx, layer in enumerate(self.layers):
                 sinks = sinks_dict.get(idx) if isinstance(sinks_dict, dict) else None
                 hidden_states = layer(hidden_states, attention_sinks=sinks)
+        # apply final norm on last pp rank
+        if hasattr(self, 'ln_f'):
+            hidden_states = self.ln_f(hidden_states)
         return hidden_states
 
 
