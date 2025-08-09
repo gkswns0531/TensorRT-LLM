@@ -1,53 +1,145 @@
+#!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import argparse
-import json
-import os
+import logging
+import sys
+import time
 from pathlib import Path
 
+import tensorrt_llm
 from tensorrt_llm.logger import logger
+from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.gpt_oss.config import GptOssConfig
 from tensorrt_llm.models.gpt_oss.convert import convert_and_save
 
 
-def parse_arguments():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--model_dir', type=str, required=True)
-    parser.add_argument('--output_dir', type=str, required=True)
-    parser.add_argument('--dtype', type=str, default='auto',
-                        choices=['auto', 'float16', 'bfloat16', 'float32'])
-    return parser.parse_args()
+def parse_arguments(args=None):
+    parser = argparse.ArgumentParser(description="Convert GPT-OSS model to TensorRT-LLM checkpoint")
+    parser.add_argument("--model_dir", type=str, required=True,
+                       help="Path to the GPT-OSS model directory")
+    parser.add_argument("--output_dir", type=str, required=True,
+                       help="Path to output TensorRT-LLM checkpoint directory")
+    parser.add_argument("--dtype", type=str, default="float16",
+                       choices=["float16", "bfloat16", "float32"],
+                       help="Data type for conversion (default: float16)")
+    parser.add_argument("--tp_size", type=int, default=1,
+                       help="Tensor parallelism size (default: 1)")
+    parser.add_argument("--pp_size", type=int, default=1,
+                       help="Pipeline parallelism size (default: 1)")
+    parser.add_argument("--workers", type=int, default=1,
+                       help="Number of worker processes (default: 1)")
+    parser.add_argument("--load_model_on_cpu", action="store_true",
+                       help="Load model on CPU to save GPU memory")
+    parser.add_argument("--use_parallel_embedding", action="store_true",
+                       help="Use parallel embedding")
+    parser.add_argument("--embedding_sharding_dim", type=int, default=0,
+                       help="Embedding sharding dimension")
+    parser.add_argument("--vocab_size", type=int, default=None,
+                       help="Vocabulary size (auto-detect if not specified)")
+    parser.add_argument("--log_level", type=str, default="info", 
+                       choices=["debug", "info", "warning", "error"],
+                       help="Logging level")
+    parser.add_argument("--verbose", action="store_true",
+                       help="Enable verbose output")
+
+    return parser.parse_args(args)
 
 
-def try_load_original_config(model_dir: Path):
-    orig_cfg = model_dir / 'original' / 'config.json'
-    if orig_cfg.exists():
-        with open(orig_cfg, 'r') as f:
-            return json.load(f)
-    return None
+def convert_checkpoint(args):
+    """Convert GPT-OSS checkpoint to TensorRT-LLM format"""
+    
+    # Setup logging
+    if args.verbose or args.log_level == "debug":
+        logging.basicConfig(level=logging.DEBUG)
+    else:
+        level = getattr(logging, args.log_level.upper())
+        logging.basicConfig(level=level)
 
-
-def main():
-    args = parse_arguments()
+    logger.info(f"TensorRT-LLM version: {tensorrt_llm.__version__}")
+    
+    # Validate paths
     model_dir = Path(args.model_dir)
     output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    if not model_dir.exists():
+        logger.error(f"Model directory does not exist: {model_dir}")
+        sys.exit(1)
+    
+    if not (model_dir / "config.json").exists():
+        logger.error(f"config.json not found in model directory: {model_dir}")
+        sys.exit(1)
+    
+    logger.info(f"Converting GPT-OSS model from {model_dir}")
+    logger.info(f"Output directory: {output_dir}")
+    logger.info(f"Data type: {args.dtype}")
+    logger.info(f"Tensor parallelism: {args.tp_size}")
+    logger.info(f"Pipeline parallelism: {args.pp_size}")
+    logger.info(f"Workers: {args.workers}")
+    
+    start_time = time.time()
+    
+    try:
+        # Process each rank
+        world_size = args.tp_size * args.pp_size
+        
+        for rank in range(world_size):
+            logger.info(f"Processing rank {rank}/{world_size}")
+            
+            # Create mapping for this rank
+            mapping = Mapping(
+                world_size=world_size,
+                rank=rank,
+                tp_size=args.tp_size,
+                pp_size=args.pp_size
+            )
+            
+            # Create config
+            config = GptOssConfig.from_hugging_face(
+                hf_config_or_dir=str(model_dir),
+                dtype=args.dtype,
+                mapping=mapping,
+                use_parallel_embedding=args.use_parallel_embedding,
+                embedding_sharding_dim=args.embedding_sharding_dim,
+            )
+            
+            # Override vocab_size if specified
+            if args.vocab_size is not None:
+                config.vocab_size = args.vocab_size
+            
+            # Convert and save this rank
+            convert_and_save(
+                model_dir=str(model_dir),
+                output_dir=str(output_dir),
+                config=config,
+                quant_config=None,  # No quantization for basic conversion
+            )
+            
+        end_time = time.time()
+        logger.info(f"Conversion completed successfully in {end_time - start_time:.2f} seconds!")
+        
+        # Print summary
+        logger.info("Conversion Summary:")
+        logger.info(f"  Model: {model_dir}")
+        logger.info(f"  Output: {output_dir}")
+        logger.info(f"  Data type: {args.dtype}")
+        logger.info(f"  Parallelism: TP={args.tp_size}, PP={args.pp_size}")
+        logger.info(f"  Total ranks: {world_size}")
+        
+    except Exception as e:
+        logger.error(f"Conversion failed: {e}")
+        if args.verbose:
+            import traceback
+            traceback.print_exc()
+        sys.exit(1)
 
-    original_cfg = try_load_original_config(model_dir)
-    if original_cfg is not None:
-        logger.info('Loading original gpt-oss config.json')
-        cfg = GptOssConfig.from_original(original_cfg, dtype=args.dtype,
-                                         mapping=None, quant_config=None)
-    else:
-        logger.info('Loading HF gpt-oss config.json')
-        cfg = GptOssConfig.from_hugging_face(str(model_dir), dtype=args.dtype,
-                                             mapping=None, quant_config=None,
-                                             trust_remote_code=True)
 
-    # Save config and placeholder shards (full conversion will be added incrementally)
-    convert_and_save(model_dir, output_dir, cfg)
-    logger.info(f'Prepared TensorRT-LLM checkpoint at {output_dir}')
+def main(args=None):
+    """Main entry point"""
+    args = parse_arguments(args)
+    convert_checkpoint(args)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
-
-

@@ -1,8 +1,8 @@
 from typing import Any, Dict, List, Optional, Union
 
-from ..modeling_utils import PretrainedConfig, QuantConfig
-from ...mapping import Mapping
-from ...layers import MoeConfig
+from tensorrt_llm.models.modeling_utils import PretrainedConfig, QuantConfig
+from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.layers import MoeConfig
 
 
 class GptOssConfig(PretrainedConfig):
@@ -151,5 +151,27 @@ class GptOssConfig(PretrainedConfig):
             hidden_act="silu",
             **kwargs,
         )
+
+    def to_dict(self):
+        """Override to handle MoeConfig serialization"""
+        output = super().to_dict()
+        
+        # Handle MoeConfig object - convert to dict if present
+        if hasattr(self, 'moe') and self.moe is not None:
+            if hasattr(self.moe, 'to_dict'):
+                output['moe'] = self.moe.to_dict()
+            elif hasattr(self.moe, '__dict__'):
+                output['moe'] = {k: v for k, v in self.moe.__dict__.items() 
+                               if not k.startswith('_')}
+            else:
+                # Fallback: try to convert MoeConfig attributes manually
+                moe_dict = {}
+                for attr in ['num_experts', 'top_k', 'capacity_factor', 'router_aux_loss_coef']:
+                    if hasattr(self.moe, attr):
+                        moe_dict[attr] = getattr(self.moe, attr)
+                if moe_dict:
+                    output['moe'] = moe_dict
+        
+        return output
 
 

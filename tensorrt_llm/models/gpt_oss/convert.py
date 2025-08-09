@@ -22,10 +22,10 @@ import safetensors
 import torch.nn.functional as F
 import torch
 
-from ...logger import logger
-from ...mapping import Mapping
-from ..modeling_utils import QuantConfig
-from ..convert_utils import split_matrix_tp, dup_kv_weight, dup_kv_bias
+from tensorrt_llm.logger import logger
+from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.models.convert_utils import split_matrix_tp, dup_kv_weight, dup_kv_bias
 from .config import GptOssConfig
 
 

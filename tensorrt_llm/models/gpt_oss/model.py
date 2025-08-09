@@ -2,12 +2,12 @@ from typing import Optional, Union
 
 import torch
 
-from ...functional import LayerNormType
-from ...layers import (Attention, AttentionMaskType, ColumnLinear, Embedding,
-                       GatedMLP, RmsNorm, MOE)
-from ...parameter import Parameter
-from ...module import Module
-from ..modeling_utils import DecoderLayerList, DecoderModelForCausalLM
+from tensorrt_llm.functional import LayerNormType
+from tensorrt_llm.layers import (Attention, AttentionMaskType, ColumnLinear, Embedding,
+                         GatedMLP, RmsNorm, MOE)
+from tensorrt_llm.parameter import Parameter
+from tensorrt_llm.module import Module
+from tensorrt_llm.models.modeling_utils import DecoderLayerList, DecoderModelForCausalLM
 from .config import GptOssConfig
 
 
@@ -50,7 +50,6 @@ class _GptOssDecoderLayer(Module):
             tp_size=config.mapping.tp_size,
             quant_mode=config.quant_mode,
             layernorm_type=LayerNormType.RmsNorm,
-            attention_window_size=sliding_window,
         )
         # register sinks parameter under attention for weight loading compatibility
         try:
