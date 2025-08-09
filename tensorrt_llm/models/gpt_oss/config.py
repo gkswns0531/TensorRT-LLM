@@ -2,6 +2,7 @@ from typing import Any, Dict, List, Optional, Union
 
 from ..modeling_utils import PretrainedConfig, QuantConfig
 from ...mapping import Mapping
+from ...layers import MoeConfig
 
 
 class GptOssConfig(PretrainedConfig):
@@ -16,6 +17,8 @@ class GptOssConfig(PretrainedConfig):
         initial_context_length: Optional[int] = None,
         num_experts: Optional[int] = None,
         experts_per_token: int = 4,
+        sliding_window: Optional[int] = None,
+        hidden_act: str = "silu",
         **kwargs,
     ) -> None:
         # gpt-oss specific
@@ -26,6 +29,16 @@ class GptOssConfig(PretrainedConfig):
         self.initial_context_length = initial_context_length
         self.num_experts = num_experts
         self.experts_per_token = experts_per_token
+        self.sliding_window = sliding_window
+        self.hidden_act = hidden_act
+
+        # Build MoE config
+        if self.num_experts and self.num_experts > 0:
+            moe = MoeConfig(num_experts=self.num_experts,
+                            top_k=self.experts_per_token)
+        else:
+            moe = MoeConfig(num_experts=0, top_k=0)
+        self.moe = moe.validate()
 
         super().__init__(**kwargs)
 
@@ -82,6 +95,8 @@ class GptOssConfig(PretrainedConfig):
             initial_context_length=initial_context_length,
             num_experts=num_experts,
             experts_per_token=experts_per_token,
+            sliding_window=getattr(hf, "sliding_window", None),
+            hidden_act=getattr(hf, "hidden_act", "silu"),
             **kwargs,
         )
 
@@ -132,6 +147,8 @@ class GptOssConfig(PretrainedConfig):
             initial_context_length=original_config.get("initial_context_length", 4096),
             num_experts=num_experts,
             experts_per_token=experts_per_token,
+            sliding_window=original_config.get("sliding_window", None),
+            hidden_act="silu",
             **kwargs,
         )
 

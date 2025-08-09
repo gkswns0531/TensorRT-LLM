@@ -83,3 +83,26 @@ def convert_and_save(
     )
 
 
+# --- Implementation guides (to be filled in next iterations) ---
+
+def _extract_qkv_from_hf(hf_model, layer_idx: int, config: GptOssConfig) -> Dict[str, torch.Tensor]:
+    """TODO: Read HF layer q,k,v weights + bias; return raw tensors prior to TP split."""
+    raise NotImplementedError
+
+
+def _tp_split_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mapping: Mapping, num_heads: int,
+                  num_kv_heads: int, head_size: int) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+    """TODO: Perform TP split and KV duplication for GQA. Return weight/bias dicts per TP rank."""
+    raise NotImplementedError
+
+
+def _extract_moe_blocks_and_scales(hf_weights: Dict[str, torch.Tensor], config: GptOssConfig) -> Dict[str, torch.Tensor]:
+    """TODO: Handle MXFP4 blocks+scales for gate_up_proj/down_proj, deinterleave gate/up and prepare per-expert tensors."""
+    raise NotImplementedError
+
+
+def _load_attention_sinks(hf_model_or_dir: Union[str, Path], num_layers: int, num_heads: int,
+                          mapping: Mapping) -> Dict[int, torch.Tensor]:
+    """TODO: Load per-layer sinks (float32 per head) and TP-slice them."""
+    raise NotImplementedError
+
