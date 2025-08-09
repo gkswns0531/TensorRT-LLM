@@ -82,16 +82,26 @@ def convert_and_save(
     except Exception as e:
         logger.warning(f"Failed to load sinks (optional): {e}")
 
-    # Load HF weight_map for QKV/Norm/Embeddings/lm_head
+    # Load weight map (HF: from index; original: from single file)
     weight_map = None
-    try:
-        with open(p_model / 'model.safetensors.index.json', 'r') as f:
-            idx = json.load(f)
-        weight_map = idx['weight_map']
-    except Exception as e:
-        logger.warning(f"Index not found or unreadable, skipping weights: {e}")
-
+    original_single_file = None
     cache_files: Dict[str, Dict[str, torch.Tensor]] = {}
+    if use_hf:
+        try:
+            with open(p_model / 'model.safetensors.index.json', 'r') as f:
+                idx = json.load(f)
+            weight_map = idx['weight_map']
+        except Exception as e:
+            logger.warning(f"Index not found or unreadable, skipping weights: {e}")
+    else:
+        # original format: single safetensors file
+        try:
+            original_single_file = p_model / 'original' / 'model.safetensors'
+            tensors = safetensors.torch.load_file(str(original_single_file))
+            weight_map = {k: str(original_single_file) for k in tensors.keys()}
+            cache_files[str(original_single_file)] = tensors
+        except Exception as e:
+            logger.warning(f"Original safetensors not found: {e}")
 
     def load_file(file_name: str) -> Dict[str, torch.Tensor]:
         if file_name in cache_files:
