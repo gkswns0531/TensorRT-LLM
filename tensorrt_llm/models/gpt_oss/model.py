@@ -3,8 +3,8 @@ from typing import Optional, Union
 import torch
 
 from ...functional import LayerNormType
-from ...layers import (Attention, AttentionMaskType, Embedding, GatedMLP,
-                       RmsNorm)
+from ...layers import (Attention, AttentionMaskType, ColumnLinear, Embedding,
+                       GatedMLP, RmsNorm)
 from ...module import Module
 from ..modeling_utils import DecoderLayerList, DecoderModelForCausalLM
 from .config import GptOssConfig
@@ -108,7 +108,21 @@ class GptOssForCausalLM(DecoderModelForCausalLM):
 
     def __init__(self, config: GptOssConfig):
         transformer = _GptOssModel(config)
-        super().__init__(config, transformer, lm_head=None)
+        vocab_size_padded = ((config.vocab_size + config.mapping.tp_size - 1)
+                             // config.mapping.tp_size) * config.mapping.tp_size if config.mapping and config.mapping.tp_size > 0 else config.vocab_size
+
+        if config.mapping.is_last_pp_rank():
+            lm_head = ColumnLinear(config.hidden_size,
+                                   vocab_size_padded,
+                                   bias=False,
+                                   dtype=config.dtype,
+                                   tp_group=config.mapping.tp_group,
+                                   tp_size=config.mapping.tp_size,
+                                   gather_output=True)
+        else:
+            lm_head = None
+
+        super().__init__(config, transformer, lm_head)
 
     @classmethod
     def from_hugging_face(
