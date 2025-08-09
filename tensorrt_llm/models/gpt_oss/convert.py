@@ -226,6 +226,17 @@ def convert_and_save(
                         weights[f'transformer.layers.{i}.mlp.fc.blocks'] = fc_blocks
                         weights[f'transformer.layers.{i}.mlp.fc.scales'] = fc_scales
                         weights[f'transformer.layers.{i}.mlp.fc.bias'] = fc_bias
+                        # NVFP4 expected auxiliary scales
+                        try:
+                            num_experts = fc_scales.shape[0]
+                            wbsf = fc_scales.to(torch.uint8).contiguous()
+                            weights[f'transformer.layers.{i}.mlp.fc.weights_block_scaling_factor'] = wbsf
+                            inter = torch.ops.trtllm.block_scale_interleave(wbsf)
+                            weights[f'transformer.layers.{i}.mlp.fc.weights_block_scaling_factor_interleaved'] = inter
+                            weights[f'transformer.layers.{i}.mlp.fc.activation_global_scaling_factor'] = torch.ones((1, ), dtype=torch.float32)
+                            weights[f'transformer.layers.{i}.mlp.fc.alpha'] = torch.ones((num_experts, ), dtype=torch.float32)
+                        except Exception:
+                            pass
                     else:
                         # Split along output-channel axis (-2) for blocks/scales and along last dim for bias
                         fc_blocks_tp = torch.chunk(fc_blocks, tp_size, dim=-2)[rank].contiguous()
@@ -234,6 +245,16 @@ def convert_and_save(
                         weights[f'transformer.layers.{i}.mlp.fc.blocks'] = fc_blocks_tp
                         weights[f'transformer.layers.{i}.mlp.fc.scales'] = fc_scales_tp
                         weights[f'transformer.layers.{i}.mlp.fc.bias'] = fc_bias_tp
+                        try:
+                            num_experts = fc_scales_tp.shape[0]
+                            wbsf = fc_scales_tp.to(torch.uint8).contiguous()
+                            weights[f'transformer.layers.{i}.mlp.fc.weights_block_scaling_factor'] = wbsf
+                            inter = torch.ops.trtllm.block_scale_interleave(wbsf)
+                            weights[f'transformer.layers.{i}.mlp.fc.weights_block_scaling_factor_interleaved'] = inter
+                            weights[f'transformer.layers.{i}.mlp.fc.activation_global_scaling_factor'] = torch.ones((1, ), dtype=torch.float32)
+                            weights[f'transformer.layers.{i}.mlp.fc.alpha'] = torch.ones((num_experts, ), dtype=torch.float32)
+                        except Exception:
+                            pass
                 except Exception as e:
                     logger.info(f"layer {i}: gate_up_proj not found ({e})")
 
@@ -248,6 +269,16 @@ def convert_and_save(
                         weights[f'transformer.layers.{i}.mlp.proj.blocks'] = proj_blocks
                         weights[f'transformer.layers.{i}.mlp.proj.scales'] = proj_scales
                         weights[f'transformer.layers.{i}.mlp.proj.bias'] = down_bias.contiguous()
+                        try:
+                            num_experts = proj_scales.shape[0]
+                            wbsf = proj_scales.to(torch.uint8).contiguous()
+                            weights[f'transformer.layers.{i}.mlp.proj.weights_block_scaling_factor'] = wbsf
+                            inter = torch.ops.trtllm.block_scale_interleave(wbsf)
+                            weights[f'transformer.layers.{i}.mlp.proj.weights_block_scaling_factor_interleaved'] = inter
+                            weights[f'transformer.layers.{i}.mlp.proj.activation_global_scaling_factor'] = torch.ones((1, ), dtype=torch.float32)
+                            weights[f'transformer.layers.{i}.mlp.proj.alpha'] = torch.ones((num_experts, ), dtype=torch.float32)
+                        except Exception:
+                            pass
                     else:
                         # Split along input axis (last dim) for blocks/scales
                         proj_blocks_tp = torch.chunk(proj_blocks, tp_size, dim=-1)[rank].contiguous()
@@ -256,6 +287,16 @@ def convert_and_save(
                         weights[f'transformer.layers.{i}.mlp.proj.scales'] = proj_scales_tp
                         # Record full bias on all ranks; non-zero ranks will be zeroed in preprocess
                         weights[f'transformer.layers.{i}.mlp.proj.bias'] = down_bias.contiguous()
+                        try:
+                            num_experts = proj_scales_tp.shape[0]
+                            wbsf = proj_scales_tp.to(torch.uint8).contiguous()
+                            weights[f'transformer.layers.{i}.mlp.proj.weights_block_scaling_factor'] = wbsf
+                            inter = torch.ops.trtllm.block_scale_interleave(wbsf)
+                            weights[f'transformer.layers.{i}.mlp.proj.weights_block_scaling_factor_interleaved'] = inter
+                            weights[f'transformer.layers.{i}.mlp.proj.activation_global_scaling_factor'] = torch.ones((1, ), dtype=torch.float32)
+                            weights[f'transformer.layers.{i}.mlp.proj.alpha'] = torch.ones((num_experts, ), dtype=torch.float32)
+                        except Exception:
+                            pass
                 except Exception as e:
                     logger.info(f"layer {i}: down_proj not found ({e})")
 
