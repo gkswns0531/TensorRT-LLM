@@ -13,11 +13,13 @@ will be implemented incrementally, following existing model patterns.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 import json
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Union
 
 import safetensors
+import torch.nn.functional as F
 import torch
 
 from ...logger import logger
@@ -100,6 +102,50 @@ def convert_and_save(
         return tensors
 
     tp_size = config.mapping.tp_size if config.mapping else 1
+
+    def _nvfp4_aux_from_mxfp4_scales(scales: torch.Tensor,
+                                     out_features: int,
+                                     in_features: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Generate NVFP4 auxiliary scale tensors from MXFP4 scales.
+
+        Returns (weights_block_scaling_factor, weights_block_scaling_factor_interleaved, activation_global_scaling_factor, alpha)
+        Shapes:
+          - wbsf, wbsf_interleaved: [E, out_features_pad, in_features_pad/16]
+          - act_gsf: [1]
+          - alpha: [E]
+        """
+        E = scales.shape[0]
+        vec = 16
+        # pad columns to ceil(in_features/vec)
+        want_cols = math.ceil(in_features / vec)
+        have_cols = scales.shape[-1]
+        if have_cols < want_cols:
+            scales = F.pad(scales, (0, want_cols - have_cols))
+        # pad rows to multiple of 128 as NVFP4 plugin prefers
+        want_rows = math.ceil(out_features / 128) * 128
+        have_rows = scales.shape[-2]
+        if have_rows < want_rows:
+            pad_rows = want_rows - have_rows
+            pad_tensor = torch.zeros((E, pad_rows, scales.shape[-1]), dtype=scales.dtype)
+            scales = torch.cat([scales, pad_tensor], dim=-2)
+
+        # cast to fp8 for weights_block_scaling_factor
+        try:
+            sf_fp8 = scales.to(torch.float8_e4m3fn)
+        except Exception:
+            # fallback: clamp to uint8 bytes then reinterpret as fp8
+            sf_fp8 = scales.clamp(0, 255).to(torch.uint8).view(torch.float8_e4m3fn)
+
+        # interleave bytes layout for plugin
+        try:
+            inter_u8 = torch.ops.trtllm.block_scale_interleave(sf_fp8.view(torch.uint8).contiguous())
+            inter = inter_u8.view(sf_fp8.dtype)
+        except Exception:
+            inter = sf_fp8
+
+        act_gsf = torch.ones((1, ), dtype=torch.float32)
+        a = torch.ones((E, ), dtype=torch.float32)
+        return sf_fp8, inter, act_gsf, a
 
     for rank in range(world_size):
         shard_path = output / f'rank{rank}.safetensors'
@@ -230,13 +276,12 @@ def convert_and_save(
                         weights[f'transformer.layers.{i}.mlp.fc.bias'] = fc_bias
                         # NVFP4 expected auxiliary scales
                         try:
-                            num_experts = fc_scales.shape[0]
-                            wbsf = fc_scales.to(torch.uint8).contiguous()
+                            wbsf, inter, act_gsf, a = _nvfp4_aux_from_mxfp4_scales(
+                                fc_scales, out_features=fc_blocks.shape[-2], in_features=fc_blocks.shape[-1])
                             weights[f'transformer.layers.{i}.mlp.fc.weights_block_scaling_factor'] = wbsf
-                            inter = torch.ops.trtllm.block_scale_interleave(wbsf)
                             weights[f'transformer.layers.{i}.mlp.fc.weights_block_scaling_factor_interleaved'] = inter
-                            weights[f'transformer.layers.{i}.mlp.fc.activation_global_scaling_factor'] = torch.ones((1, ), dtype=torch.float32)
-                            weights[f'transformer.layers.{i}.mlp.fc.alpha'] = torch.ones((num_experts, ), dtype=torch.float32)
+                            weights[f'transformer.layers.{i}.mlp.fc.activation_global_scaling_factor'] = act_gsf
+                            weights[f'transformer.layers.{i}.mlp.fc.alpha'] = a
                         except Exception:
                             pass
                     else:
@@ -249,13 +294,12 @@ def convert_and_save(
                         weights[f'transformer.layers.{i}.mlp.fc.scales'] = fc_scales_tp
                         weights[f'transformer.layers.{i}.mlp.fc.bias'] = fc_bias_tp
                         try:
-                            num_experts = fc_scales_tp.shape[0]
-                            wbsf = fc_scales_tp.to(torch.uint8).contiguous()
+                            wbsf, inter, act_gsf, a = _nvfp4_aux_from_mxfp4_scales(
+                                fc_scales_tp, out_features=fc_blocks_tp.shape[-2], in_features=fc_blocks_tp.shape[-1])
                             weights[f'transformer.layers.{i}.mlp.fc.weights_block_scaling_factor'] = wbsf
-                            inter = torch.ops.trtllm.block_scale_interleave(wbsf)
                             weights[f'transformer.layers.{i}.mlp.fc.weights_block_scaling_factor_interleaved'] = inter
-                            weights[f'transformer.layers.{i}.mlp.fc.activation_global_scaling_factor'] = torch.ones((1, ), dtype=torch.float32)
-                            weights[f'transformer.layers.{i}.mlp.fc.alpha'] = torch.ones((num_experts, ), dtype=torch.float32)
+                            weights[f'transformer.layers.{i}.mlp.fc.activation_global_scaling_factor'] = act_gsf
+                            weights[f'transformer.layers.{i}.mlp.fc.alpha'] = a
                         except Exception:
                             pass
                 except Exception as e:
@@ -274,13 +318,12 @@ def convert_and_save(
                         weights[f'transformer.layers.{i}.mlp.proj.scales'] = proj_scales
                         weights[f'transformer.layers.{i}.mlp.proj.bias'] = down_bias.contiguous()
                         try:
-                            num_experts = proj_scales.shape[0]
-                            wbsf = proj_scales.to(torch.uint8).contiguous()
+                            wbsf, inter, act_gsf, a = _nvfp4_aux_from_mxfp4_scales(
+                                proj_scales, out_features=proj_blocks.shape[-2], in_features=proj_blocks.shape[-1])
                             weights[f'transformer.layers.{i}.mlp.proj.weights_block_scaling_factor'] = wbsf
-                            inter = torch.ops.trtllm.block_scale_interleave(wbsf)
                             weights[f'transformer.layers.{i}.mlp.proj.weights_block_scaling_factor_interleaved'] = inter
-                            weights[f'transformer.layers.{i}.mlp.proj.activation_global_scaling_factor'] = torch.ones((1, ), dtype=torch.float32)
-                            weights[f'transformer.layers.{i}.mlp.proj.alpha'] = torch.ones((num_experts, ), dtype=torch.float32)
+                            weights[f'transformer.layers.{i}.mlp.proj.activation_global_scaling_factor'] = act_gsf
+                            weights[f'transformer.layers.{i}.mlp.proj.alpha'] = a
                         except Exception:
                             pass
                     else:
@@ -293,13 +336,12 @@ def convert_and_save(
                         # Record full bias on all ranks; non-zero ranks will be zeroed in preprocess
                         weights[f'transformer.layers.{i}.mlp.proj.bias'] = down_bias.contiguous()
                         try:
-                            num_experts = proj_scales_tp.shape[0]
-                            wbsf = proj_scales_tp.to(torch.uint8).contiguous()
+                            wbsf, inter, act_gsf, a = _nvfp4_aux_from_mxfp4_scales(
+                                proj_scales_tp, out_features=proj_blocks_tp.shape[-2], in_features=proj_blocks_tp.shape[-1])
                             weights[f'transformer.layers.{i}.mlp.proj.weights_block_scaling_factor'] = wbsf
-                            inter = torch.ops.trtllm.block_scale_interleave(wbsf)
                             weights[f'transformer.layers.{i}.mlp.proj.weights_block_scaling_factor_interleaved'] = inter
-                            weights[f'transformer.layers.{i}.mlp.proj.activation_global_scaling_factor'] = torch.ones((1, ), dtype=torch.float32)
-                            weights[f'transformer.layers.{i}.mlp.proj.alpha'] = torch.ones((num_experts, ), dtype=torch.float32)
+                            weights[f'transformer.layers.{i}.mlp.proj.activation_global_scaling_factor'] = act_gsf
+                            weights[f'transformer.layers.{i}.mlp.proj.alpha'] = a
                         except Exception:
                             pass
                 except Exception as e:
