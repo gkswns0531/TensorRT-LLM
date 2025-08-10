@@ -2,7 +2,9 @@ from typing import Optional, Union
 
 import torch
 
-from tensorrt_llm.functional import LayerNormType, AllReduceFusionOp, constant, default_net
+from tensorrt_llm.functional import (LayerNormType, AllReduceFusionOp, constant,
+                                     default_net, PositionEmbeddingType, cast,
+                                     int32_array)
 from tensorrt_llm.layers import (Attention, AttentionMaskType, ColumnLinear, Embedding,
                          GatedMLP, RmsNorm, MOE, MoeConfig)
 from tensorrt_llm.parameter import Parameter
@@ -25,12 +27,20 @@ class _GptOssDecoderLayer(Module):
                                        dtype=dtype)
 
         # sliding window control via layer_types if provided
-        sliding_window = None
+        use_sliding_window = False
         if config.layer_types:
             lt = config.layer_types[layer_idx] if layer_idx < len(
                 config.layer_types) else None
-            if lt == 'sliding_attention':
-                sliding_window = getattr(config, 'sliding_window', None)
+            if lt == 'sliding_attention' and getattr(config, 'sliding_window', None):
+                use_sliding_window = True
+
+        # Normalize position embedding type for compatibility with plugin expectations
+        pos_type = config.position_embedding_type
+        if isinstance(pos_type, str):
+            if pos_type.lower() == 'yarn':
+                pos_type = PositionEmbeddingType.rope_gpt_neox
+        # Propagate normalized position embedding type back to config for plugin const params
+        self.config.position_embedding_type = pos_type
 
         self.attention = Attention(
             local_layer_idx=layer_idx,
@@ -40,9 +50,11 @@ class _GptOssDecoderLayer(Module):
             num_kv_heads=config.num_key_value_heads,
             max_position_embeddings=config.max_position_embeddings,
             dtype=dtype,
+            # Always use causal mask type for GPT attention plugin.
+            # Sliding window is controlled via host_max_attention_window_sizes.
             attention_mask_type=AttentionMaskType.causal,
             bias=config.attention_bias,
-            position_embedding_type=config.position_embedding_type,
+            position_embedding_type=pos_type,
             rotary_embedding_base=config.rope_theta,
             rotary_embedding_scaling=config.rope_scaling,
             tp_rank=config.mapping.tp_rank,
@@ -81,9 +93,9 @@ class _GptOssDecoderLayer(Module):
                                       eps=config.norm_epsilon,
                                       dtype=dtype)
 
-    def forward(self, 
-                hidden_states: torch.Tensor, 
-                *, 
+    def forward(self,
+                hidden_states: torch.Tensor,
+                *,
                 attention_sinks: Optional[torch.Tensor] = None,
                 attention_mask=None,
                 use_cache=False,
@@ -109,20 +121,31 @@ class _GptOssDecoderLayer(Module):
             sinks_tensor = getattr(self.attention, 'sinks')
             # Parameter may carry .value or .data depending on backend; forward raw to attention
             sinks_arg = getattr(sinks_tensor, 'value', None) or getattr(sinks_tensor, 'data', None) or sinks_tensor
-        attn_out = self.attention(hidden_states, 
-                                attention_mask=attention_mask,
-                                use_cache=use_cache,
-                                spec_decoding_params=spec_decoding_params,
-                                kv_cache_params=kv_cache_params,
-                                attention_params=attention_params,
-                                lora_layer_params=lora_layer_params,
-                                attention_sinks=sinks_arg)
+        # Ensure attention_params is not None to avoid downstream attribute access errors
+        attn_kwargs = dict(attention_mask=attention_mask,
+                           use_cache=use_cache,
+                           spec_decoding_params=spec_decoding_params,
+                           kv_cache_params=kv_cache_params,
+                           lora_layer_params=lora_layer_params)
+        if attention_params is not None:
+            attn_kwargs['attention_params'] = attention_params
+        attn_result = self.attention(hidden_states, **attn_kwargs)
+        attn_out = attn_result[0] if isinstance(attn_result, tuple) else attn_result
+
+        # Align dtype before residual add
+        if hasattr(residual, 'dtype') and hasattr(attn_out, 'dtype') and residual.dtype != attn_out.dtype:
+            attn_out = cast(attn_out, residual.dtype)
 
         hidden_states = residual + attn_out
 
         residual = hidden_states
         hidden_states = self.post_layernorm(hidden_states)
         mlp_out = self.mlp(hidden_states, lora_layer_params=lora_layer_params)
+
+        # Align dtype before residual add
+        if hasattr(hidden_states, 'dtype') and hasattr(mlp_out, 'dtype') and hidden_states.dtype != mlp_out.dtype:
+            mlp_out = cast(mlp_out, hidden_states.dtype)
+
         hidden_states = residual + mlp_out
         return hidden_states
 
@@ -131,6 +154,7 @@ class _GptOssModel(Module):
 
     def __init__(self, config: GptOssConfig) -> None:
         super().__init__()
+        self.config = config
         self.mapping = config.mapping
         if self.mapping.is_first_pp_rank():
             self.vocab_embedding = Embedding(config.vocab_size,
@@ -152,6 +176,26 @@ class _GptOssModel(Module):
         if self.mapping.is_first_pp_rank():
             hidden_states = self.vocab_embedding(input_ids)
 
+        # Unify dtype once at model entry to avoid mixed Half/BFloat16 downstream
+        target_dtype = getattr(self.config, 'dtype', None)
+        if target_dtype is not None and hasattr(hidden_states, 'dtype') and hidden_states.dtype != target_dtype:
+            hidden_states = cast(hidden_states, target_dtype)
+
+        # Provide host_max_attention_window_sizes if plugin expects it and not provided by runtime
+        kv_params = kwargs.get('kv_cache_params', None)
+        if (kv_params is not None and getattr(default_net().plugin_config, 'gpt_attention_plugin', False)
+                and getattr(kv_params, 'host_max_attention_window_sizes', None) is None):
+            # Build per-PP-layer window sizes: sliding_attention -> config.sliding_window else max_position_embeddings
+            window_sizes: list[int] = []
+            for layer in self.layers:
+                # layer.layer_idx is the global layer index
+                window = int(self.config.max_position_embeddings)
+                if self.config.layer_types and layer.layer_idx < len(self.config.layer_types):
+                    if self.config.layer_types[layer.layer_idx] == 'sliding_attention' and getattr(self.config, 'sliding_window', None):
+                        window = int(self.config.sliding_window)
+                window_sizes.append(window)
+            kv_params.host_max_attention_window_sizes = constant(int32_array(window_sizes))
+
         # Pass sinks per layer if provided via kwargs; otherwise attempt to use layer.attention.sinks
         sinks_dict: Optional[dict] = kwargs.get('attention_sinks_dict')
         for idx, layer in enumerate(self.layers):
@@ -161,10 +205,26 @@ class _GptOssModel(Module):
             if sinks is None and hasattr(layer.attention, 'sinks'):
                 param = getattr(layer.attention, 'sinks')
                 sinks = getattr(param, 'value', None) or getattr(param, 'data', None) or param
-            hidden_states = layer(hidden_states, attention_sinks=sinks)
+            # Forward required runtime params down to the layer
+            layer_kwargs = {}
+            for k in (
+                'attention_mask',
+                'use_cache',
+                'spec_decoding_params',
+                'kv_cache_params',
+                'attention_params',
+                'lora_layer_params',
+            ):
+                if k in kwargs:
+                    layer_kwargs[k] = kwargs[k]
+            hidden_states = layer(hidden_states, attention_sinks=sinks, **layer_kwargs)
         # apply final norm on last pp rank
         if hasattr(self, 'ln_f'):
             hidden_states = self.ln_f(hidden_states)
+        # Return tuple when caching is enabled to satisfy builder expectations
+        use_cache = bool(kwargs.get('use_cache', False)) or (kwargs.get('kv_cache_params') is not None)
+        if use_cache:
+            return hidden_states, None
         return hidden_states
 
 

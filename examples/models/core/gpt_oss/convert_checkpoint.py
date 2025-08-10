@@ -44,10 +44,10 @@ def parse_arguments(args=None):
     parser.add_argument("--verbose", action="store_true",
                        help="Enable verbose output")
 
-    # MXFP4/BF16 MoE export control
+    # MXFP4/BF16/FP16 MoE export control
     parser.add_argument("--moe_export", type=str, default="auto",
-                        choices=["auto", "mxfp4", "bf16"],
-                        help="MoE export mode: 'mxfp4' keeps FP4 blocks and NVFP4 scales; 'bf16' dequantizes to BF16; 'auto' based on target_arch")
+                        choices=["auto", "mxfp4", "bf16", "fp16"],
+                        help="MoE export mode: 'mxfp4' keeps FP4 blocks and NVFP4 scales; 'bf16' dequantizes to BF16; 'fp16' dequantizes to FP16; 'auto' based on target_arch")
     parser.add_argument("--target_arch", type=str, default=None,
                         help="Target architecture hint (e.g., sm80, a100, sm89, l4, sm100, h100, b200). Used when moe_export=auto")
 

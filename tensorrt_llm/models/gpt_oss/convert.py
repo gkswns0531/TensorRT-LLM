@@ -68,7 +68,7 @@ def convert_and_save(
     config: GptOssConfig,
     *,
     quant_config: Optional[QuantConfig] = None,
-    moe_export: str = 'auto',
+    moe_export: str = 'auto',  # {'auto','mxfp4','bf16','fp16'}
     target_arch: Optional[str] = None,
     nvfp4_scale_mode: str = 'heuristic',  # {'heuristic','ones','auto'}
     stream_tile_rows: int = _STREAM_TILE_ROWS,
@@ -93,9 +93,14 @@ def convert_and_save(
     if moe_export == 'auto':
         arch = (target_arch or '').lower()
         if arch in ('sm80', 'sm_80', 'a100', 'sm89', 'sm_89', 'l4'):
-            moe_mode = 'bf16'
+            moe_mode = 'fp16'
         else:
             moe_mode = 'mxfp4'
+    elif moe_export in ('mxfp4', 'bf16', 'fp16'):
+        moe_mode = moe_export
+
+    # Force RoPE type that TRT plugin recognizes
+    config.position_embedding_type = "rope_gpt_neox"
 
     # Attach quantization hint into config: NVFP4 when exporting MXFP4
     if moe_mode == 'mxfp4':
@@ -358,6 +363,13 @@ def convert_and_save(
         # Recompute implied head again after adjustments
         tp_size = config.mapping.tp_size if config.mapping else 1
         nl = config.num_hidden_layers
+        # Set dequantization dtype for non-MXFP4 export
+        deq_dtype = None
+        if moe_mode == 'bf16':
+            deq_dtype = torch.bfloat16
+        elif moe_mode == 'fp16':
+            deq_dtype = torch.float16
+
         # Per-layer
         for i in range(nl):
                 # q,k,v
@@ -368,12 +380,12 @@ def convert_and_save(
                     tensors = load_file(file)
                     return tensors[name]
 
-                q_w = get(f'model.layers.{i}.self_attn.q_proj.weight')
-                k_w = get(f'model.layers.{i}.self_attn.k_proj.weight')
-                v_w = get(f'model.layers.{i}.self_attn.v_proj.weight')
-                q_b = get(f'model.layers.{i}.self_attn.q_proj.bias')
-                k_b = get(f'model.layers.{i}.self_attn.k_proj.bias')
-                v_b = get(f'model.layers.{i}.self_attn.v_proj.bias')
+                q_w = get(f'model.layers.{i}.self_attn.q_proj.weight').to(torch_dtype)
+                k_w = get(f'model.layers.{i}.self_attn.k_proj.weight').to(torch_dtype)
+                v_w = get(f'model.layers.{i}.self_attn.v_proj.weight').to(torch_dtype)
+                q_b = get(f'model.layers.{i}.self_attn.q_proj.bias').to(torch_dtype)
+                k_b = get(f'model.layers.{i}.self_attn.k_proj.bias').to(torch_dtype)
+                v_b = get(f'model.layers.{i}.self_attn.v_proj.bias').to(torch_dtype)
 
                 # shape checks for QKV
                 nh = config.num_attention_heads
@@ -420,8 +432,8 @@ def convert_and_save(
                     weights[f'transformer.layers.{i}.attention.qkv.weight'] = qkv_w_tp
                     weights[f'transformer.layers.{i}.attention.qkv.bias'] = qkv_b_tp
 
-                o_w = get(f'model.layers.{i}.self_attn.o_proj.weight')
-                o_b = get(f'model.layers.{i}.self_attn.o_proj.bias')
+                o_w = get(f'model.layers.{i}.self_attn.o_proj.weight').to(torch_dtype)
+                o_b = get(f'model.layers.{i}.self_attn.o_proj.bias').to(torch_dtype)
                 assert o_w.shape[1] == nh * hs, f"o_proj.cols {o_w.shape[1]} != num_heads*head_size {nh*hs}"
                 if tp_size == 1:
                     weights[f'transformer.layers.{i}.attention.dense.weight'] = o_w.contiguous()
@@ -433,8 +445,8 @@ def convert_and_save(
                     # Write bias on all ranks; non-zero ranks will be zeroed in preprocess
                     weights[f'transformer.layers.{i}.attention.dense.bias'] = o_b.contiguous()
 
-                in_ln = get(f'model.layers.{i}.input_layernorm.weight')
-                po_ln = get(f'model.layers.{i}.post_attention_layernorm.weight')
+                in_ln = get(f'model.layers.{i}.input_layernorm.weight').to(torch_dtype)
+                po_ln = get(f'model.layers.{i}.post_attention_layernorm.weight').to(torch_dtype)
                 weights[f'transformer.layers.{i}.input_layernorm.weight'] = in_ln.contiguous()
                 weights[f'transformer.layers.{i}.post_layernorm.weight'] = po_ln.contiguous()
 
@@ -478,6 +490,11 @@ def convert_and_save(
                 gate_b = gate_up_bias[:, ::2]
                 up_b = gate_up_bias[:, 1::2]
                 fc_bias = torch.cat([gate_b, up_b], dim=-1).contiguous()
+                # Cast bias to target dtype depending on moe_mode
+                if moe_mode == 'mxfp4':
+                    fc_bias = fc_bias.to(torch_dtype)
+                else:
+                    fc_bias = fc_bias.to(deq_dtype)
 
                 def _collapse_pack_dim(blocks: torch.Tensor) -> torch.Tensor:
                     if blocks.dim() == 4:
@@ -518,8 +535,8 @@ def convert_and_save(
                         weights[f'transformer.layers.{i}.mlp.fc.activation_global_scaling_factor'] = act_gsf
                         weights[f'transformer.layers.{i}.mlp.fc.alpha'] = alpha
                 else:
-                    # Force BF16 for offline dequantization regardless of config.dtype
-                    deq_dtype = torch.bfloat16
+                    # Offline dequantization to desired float dtype (bf16/fp16)
+                    assert deq_dtype is not None, f"Unsupported moe_mode {moe_mode}"
                     if tp_size == 1:
                         fc_weight = _dequantize_mxfp4_streaming(fc_blocks, fc_scales, dtype=deq_dtype, tile_rows=stream_tile_rows)
                         expected_in_fc = config.hidden_size
@@ -564,7 +581,7 @@ def convert_and_save(
                     if tp_size == 1:
                         proj_blocks_ckpt = _collapse_pack_dim(proj_blocks)
                         weights[f'transformer.layers.{i}.mlp.proj.weight'] = proj_blocks_ckpt.contiguous()
-                        weights[f'transformer.layers.{i}.mlp.proj.bias'] = down_bias.contiguous()
+                        weights[f'transformer.layers.{i}.mlp.proj.bias'] = down_bias.to(torch_dtype).contiguous()
 
                         proj_out_features = proj_blocks.shape[1]
                         proj_in_features = config.intermediate_size
@@ -581,7 +598,7 @@ def convert_and_save(
 
                         proj_blocks_ckpt = _collapse_pack_dim(proj_blocks_tp)
                         weights[f'transformer.layers.{i}.mlp.proj.weight'] = proj_blocks_ckpt.contiguous()
-                        weights[f'transformer.layers.{i}.mlp.proj.bias'] = down_bias.contiguous()
+                        weights[f'transformer.layers.{i}.mlp.proj.bias'] = down_bias.to(torch_dtype).contiguous()
 
                         proj_out_features = proj_blocks.shape[1]
                         proj_in_features_tp = max(1, config.intermediate_size // tp_size)
@@ -592,13 +609,14 @@ def convert_and_save(
                         weights[f'transformer.layers.{i}.mlp.proj.activation_global_scaling_factor'] = act_gsf
                         weights[f'transformer.layers.{i}.mlp.proj.alpha'] = alpha
                 else:
+                    assert deq_dtype is not None, f"Unsupported moe_mode {moe_mode}"
                     if tp_size == 1:
                         proj_weight = _dequantize_mxfp4_streaming(proj_blocks, proj_scales, dtype=deq_dtype, tile_rows=stream_tile_rows)
                         expected_in = config.intermediate_size
                         if proj_weight.shape[-1] > expected_in:
                             proj_weight = proj_weight[..., :expected_in]
                         weights[f'transformer.layers.{i}.mlp.proj.weight'] = proj_weight.contiguous()
-                        weights[f'transformer.layers.{i}.mlp.proj.bias'] = down_bias.contiguous()
+                        weights[f'transformer.layers.{i}.mlp.proj.bias'] = down_bias.to(deq_dtype).contiguous()
                     else:
                         in_axis_blocks_tp = -2 if proj_blocks.dim() == 4 else -1
                         proj_blocks_tp = torch.chunk(proj_blocks, tp_size, dim=in_axis_blocks_tp)[rank].contiguous()
@@ -608,12 +626,12 @@ def convert_and_save(
                         if proj_weight_tp.shape[-1] > expected_in_tp:
                             proj_weight_tp = proj_weight_tp[..., :expected_in_tp]
                         weights[f'transformer.layers.{i}.mlp.proj.weight'] = proj_weight_tp.contiguous()
-                        weights[f'transformer.layers.{i}.mlp.proj.bias'] = down_bias.contiguous()
+                        weights[f'transformer.layers.{i}.mlp.proj.bias'] = down_bias.to(deq_dtype).contiguous()
 
                 # BF16 per-expert path intentionally not supported for gpt-oss (MoE uses MXFP4)
 
         # Embeddings & final norm & lm_head (once per rank)
-        emb_w = get('model.embed_tokens.weight')
+        emb_w = get('model.embed_tokens.weight').to(torch_dtype)
         if tp_size == 1:
             weights['transformer.vocab_embedding.weight'] = emb_w.contiguous()
         else:
@@ -621,10 +639,10 @@ def convert_and_save(
             tp_emb = torch.chunk(emb_w, tp_size, dim=0)[rank].contiguous()
             weights['transformer.vocab_embedding.weight'] = tp_emb
 
-        ln_f = get('model.norm.weight')
+        ln_f = get('model.norm.weight').to(torch_dtype)
         weights['transformer.ln_f.weight'] = ln_f.contiguous()
 
-        lm_w = get('lm_head.weight')
+        lm_w = get('lm_head.weight').to(torch_dtype)
         if tp_size == 1:
             weights['lm_head.weight'] = lm_w.contiguous()
         else:
@@ -643,7 +661,7 @@ def convert_and_save(
             tensors = load_file(file)
             if name not in tensors:
                 continue
-            w = tensors[name]
+            w = tensors[name].to(torch_dtype)
             # keep unsplit; MOE handles distribution internally
             weights[f'transformer.layers.{i}.mlp.router.weight'] = w.contiguous()
 

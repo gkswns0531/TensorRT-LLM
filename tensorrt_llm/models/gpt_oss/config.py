@@ -41,6 +41,9 @@ class GptOssConfig(PretrainedConfig):
         self.moe = moe.validate()
 
         # Ensure parent config receives hidden_act to avoid being reset to default ('gelu')
+        # Align logits_dtype with dtype by default for dtype unification across the model
+        if 'logits_dtype' not in kwargs and 'dtype' in kwargs:
+            kwargs['logits_dtype'] = kwargs['dtype']
         super().__init__(hidden_act=hidden_act, **kwargs)
 
     @classmethod
@@ -126,6 +129,7 @@ class GptOssConfig(PretrainedConfig):
             experts_per_token=experts_per_token,
             sliding_window=getattr(hf, "sliding_window", None),
             hidden_act=hidden_act,
+            logits_dtype=dtype,
             **kwargs,
         )
 
