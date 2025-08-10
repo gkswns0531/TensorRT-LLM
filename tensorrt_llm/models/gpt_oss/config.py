@@ -1,7 +1,8 @@
 from typing import Any, Dict, List, Optional, Union
+import json
 
 from tensorrt_llm.models.modeling_utils import PretrainedConfig, QuantConfig
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.mapping import Mapping  
 from tensorrt_llm.layers import MoeConfig
 
 
@@ -15,7 +16,7 @@ class GptOssConfig(PretrainedConfig):
         rope_theta: float = 150000.0,
         rope_scaling: Optional[Dict[str, Any]] = None,
         initial_context_length: Optional[int] = None,
-        moe: Optional[Union[MoeConfig, Dict[str, Any]]] = None,
+        moe: Optional[Union[MoeConfig, dict]] = None,
         experts_per_token: int = 4,
         sliding_window: Optional[int] = None,
         hidden_act: str = "silu",
@@ -31,19 +32,21 @@ class GptOssConfig(PretrainedConfig):
         self.sliding_window = sliding_window
         self.hidden_act = hidden_act
 
-        # Build MoE config (coerce dict to MoeConfig)
-        if isinstance(moe, dict):
-            moe = MoeConfig.from_dict(moe)
+        # Build MoE config (same as Qwen approach)  
         if moe is None:
             moe = MoeConfig(num_experts=0, top_k=0)
+        elif isinstance(moe, dict):
+            moe = MoeConfig.from_dict(moe)
+        assert isinstance(moe, MoeConfig)
         self.moe = moe.validate()
 
-        super().__init__(**kwargs)
+        # Ensure parent config receives hidden_act to avoid being reset to default ('gelu')
+        super().__init__(hidden_act=hidden_act, **kwargs)
 
     @classmethod
     def from_hugging_face(
         cls,
-        hf_config_or_dir: Union[str, "transformers.PretrainedConfig"],
+        hf_config_or_dir,
         dtype: str = "auto",
         mapping: Optional[Mapping] = None,
         quant_config: Optional[QuantConfig] = None,
@@ -71,14 +74,38 @@ class GptOssConfig(PretrainedConfig):
         if num_experts is not None and num_experts > 0:
             moe_cfg = MoeConfig(num_experts=num_experts, top_k=experts_per_token).validate()
 
+        # Hidden activation: TRT-LLM gating expects a gated activation name (e.g., 'swiglu').
+        # GPT-OSS MoE uses gate_up fusion semantics, so enforce 'swiglu' when MoE is present.
+        hidden_act = getattr(hf, "hidden_act", "silu")
+        if moe_cfg is not None and moe_cfg.num_experts > 0:
+            hidden_act = "swiglu"
+
+        # Derive head_size with torch-backend-compatible fallback
+        hidden_size = hf.hidden_size
+        num_attention_heads = hf.num_attention_heads
+        head_dim = getattr(hf, 'head_dim', None)
+        if not isinstance(head_dim, int) or head_dim * num_attention_heads != hidden_size:
+            if hidden_size % num_attention_heads != 0:
+                raise ValueError(
+                    f"Invalid attention dims: hidden_size={hidden_size}, num_attention_heads={num_attention_heads}, head_dim={head_dim}."
+                )
+            head_dim = hidden_size // num_attention_heads
+
+        # Validate layer_types length when provided
+        if isinstance(layer_types, list) and len(layer_types) > 0:
+            if len(layer_types) != hf.num_hidden_layers:
+                raise ValueError(
+                    f"layer_types length {len(layer_types)} must equal num_hidden_layers {hf.num_hidden_layers}"
+                )
+
         return cls(
             architecture=getattr(hf, "architectures", [""])[0],
             dtype=dtype,
             num_hidden_layers=hf.num_hidden_layers,
-            num_attention_heads=hf.num_attention_heads,
+            num_attention_heads=num_attention_heads,
             num_key_value_heads=hf.num_key_value_heads,
-            head_size=hf.head_dim,
-            hidden_size=hf.hidden_size,
+            head_size=head_dim,
+            hidden_size=hidden_size,
             intermediate_size=hf.intermediate_size,
             vocab_size=hf.vocab_size,
             max_position_embeddings=hf.max_position_embeddings,
@@ -98,63 +125,7 @@ class GptOssConfig(PretrainedConfig):
             moe=moe_cfg,
             experts_per_token=experts_per_token,
             sliding_window=getattr(hf, "sliding_window", None),
-            hidden_act=getattr(hf, "hidden_act", "silu"),
-            **kwargs,
-        )
-
-    @classmethod
-    def from_original(
-        cls,
-        original_config: Dict[str, Any],
-        dtype: str = "auto",
-        mapping: Optional[Mapping] = None,
-        quant_config: Optional[QuantConfig] = None,
-        **kwargs,
-    ) -> "GptOssConfig":
-        # Original schema keys
-        num_experts = original_config.get("num_experts")
-        experts_per_token = original_config.get("experts_per_token", 4)
-        rope_theta = float(original_config.get("rope_theta", 150000.0))
-        rope_scaling = {
-            "factor": original_config.get("rope_scaling_factor", 1.0),
-            "beta_fast": original_config.get("rope_ntk_beta", 32.0),
-            "beta_slow": original_config.get("rope_ntk_alpha", 1.0),
-            "original_max_position_embeddings": original_config.get("initial_context_length", 4096),
-            "rope_type": "yarn",
-        }
-
-        moe_cfg = None
-        if num_experts is not None and num_experts > 0:
-            moe_cfg = MoeConfig(num_experts=num_experts, top_k=experts_per_token).validate()
-
-        return cls(
-            architecture="GptOssForCausalLM",
-            dtype=dtype,
-            num_hidden_layers=original_config["num_hidden_layers"],
-            num_attention_heads=original_config["num_attention_heads"],
-            num_key_value_heads=original_config["num_key_value_heads"],
-            head_size=original_config["head_dim"],
-            hidden_size=original_config["hidden_size"],
-            intermediate_size=original_config["intermediate_size"],
-            vocab_size=original_config["vocab_size"],
-            max_position_embeddings=original_config.get("max_position_embeddings", 131072),
-            position_embedding_type="yarn",
-            rotary_embedding_dim=None,
-            norm_epsilon=1e-5,
-            tie_word_embeddings=False,
-            use_logn_attn=False,
-            mapping=mapping,
-            quantization=quant_config,
-            # gpt-oss specific
-            layer_types=[],  # original에는 명시 없음 → 모델에서 기본 규칙 보완
-            attention_bias=True,
-            rope_theta=rope_theta,
-            rope_scaling=rope_scaling,
-            initial_context_length=original_config.get("initial_context_length", 4096),
-            moe=moe_cfg,
-            experts_per_token=experts_per_token,
-            sliding_window=original_config.get("sliding_window", None),
-            hidden_act="silu",
+            hidden_act=hidden_act,
             **kwargs,
         )
 

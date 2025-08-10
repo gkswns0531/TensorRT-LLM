@@ -2,7 +2,7 @@ from typing import Optional, Union
 
 import torch
 
-from tensorrt_llm.functional import LayerNormType
+from tensorrt_llm.functional import LayerNormType, AllReduceFusionOp, constant, default_net
 from tensorrt_llm.layers import (Attention, AttentionMaskType, ColumnLinear, Embedding,
                          GatedMLP, RmsNorm, MOE, MoeConfig)
 from tensorrt_llm.parameter import Parameter
@@ -52,26 +52,20 @@ class _GptOssDecoderLayer(Module):
             layernorm_type=LayerNormType.RmsNorm,
         )
         # register sinks parameter under attention for weight loading compatibility
-        try:
-            setattr(self.attention, 'sinks', Parameter(shape=(config.num_attention_heads // max(1, config.mapping.tp_size), ),
+        setattr(self.attention, 'sinks', Parameter(shape=(config.num_attention_heads // max(1, config.mapping.tp_size), ),
                                                        dtype='float32'))
-        except Exception:
-            pass
 
-        # Prefer MOE when configured; fallback to GatedMLP otherwise
-        moe_cfg = getattr(config, 'moe', None)
-        if isinstance(moe_cfg, dict):
-            try:
-                moe_cfg = MoeConfig.from_dict(moe_cfg)
-            except Exception:
-                moe_cfg = None
-        if moe_cfg and getattr(moe_cfg, 'num_experts', 0) > 0:
-            self.mlp = MOE(moe_config=moe_cfg,
+        # Use MOE when configured; fallback to GatedMLP otherwise (same as Qwen)
+        if config.moe.has_moe():
+            self.mlp = MOE(moe_config=config.moe,
                            hidden_size=config.hidden_size,
                            ffn_hidden_size=config.intermediate_size,
                            hidden_act=config.hidden_act,
+                           mapping=config.mapping,
                            bias=True,
                            dtype=dtype,
+                           tp_size=config.mapping.tp_size,
+                           tp_group=config.mapping.tp_group,
                            quant_mode=config.quant_mode)
         else:
             self.mlp = GatedMLP(hidden_size=config.hidden_size,
@@ -87,7 +81,24 @@ class _GptOssDecoderLayer(Module):
                                       eps=config.norm_epsilon,
                                       dtype=dtype)
 
-    def forward(self, hidden_states: torch.Tensor, *, attention_sinks: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, 
+                hidden_states: torch.Tensor, 
+                *, 
+                attention_sinks: Optional[torch.Tensor] = None,
+                attention_mask=None,
+                use_cache=False,
+                spec_decoding_params=None,
+                kv_cache_params=None,
+                attention_params=None,
+                lora_layer_params=None) -> torch.Tensor:
+        
+        # Basic NVFP4 compatibility check (similar to Llama)
+        if (default_net().plugin_config.reduce_fusion 
+            and default_net().plugin_config.user_buffer 
+            and self.config.quant_mode.has_nvfp4()):
+            assert default_net().plugin_config.gemm_plugin == "nvfp4", \
+                "UB with nvfp4 model must use nvfp4 gemm plugin"
+        
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
@@ -95,21 +106,23 @@ class _GptOssDecoderLayer(Module):
         attn_out = None
         sinks_arg = attention_sinks
         if sinks_arg is None and hasattr(self.attention, 'sinks'):
-            try:
-                sinks_tensor = getattr(self.attention, 'sinks')
-                # Parameter may carry .value or .data depending on backend; forward raw to attention
-                sinks_arg = getattr(sinks_tensor, 'value', None) or getattr(sinks_tensor, 'data', None) or sinks_tensor
-            except Exception:
-                sinks_arg = None
-        try:
-            attn_out = self.attention(hidden_states, attention_sinks=sinks_arg)
-        except TypeError:
-            attn_out = self.attention(hidden_states)
+            sinks_tensor = getattr(self.attention, 'sinks')
+            # Parameter may carry .value or .data depending on backend; forward raw to attention
+            sinks_arg = getattr(sinks_tensor, 'value', None) or getattr(sinks_tensor, 'data', None) or sinks_tensor
+        attn_out = self.attention(hidden_states, 
+                                attention_mask=attention_mask,
+                                use_cache=use_cache,
+                                spec_decoding_params=spec_decoding_params,
+                                kv_cache_params=kv_cache_params,
+                                attention_params=attention_params,
+                                lora_layer_params=lora_layer_params,
+                                attention_sinks=sinks_arg)
+
         hidden_states = residual + attn_out
 
         residual = hidden_states
         hidden_states = self.post_layernorm(hidden_states)
-        mlp_out = self.mlp(hidden_states)
+        mlp_out = self.mlp(hidden_states, lora_layer_params=lora_layer_params)
         hidden_states = residual + mlp_out
         return hidden_states
 
@@ -139,14 +152,16 @@ class _GptOssModel(Module):
         if self.mapping.is_first_pp_rank():
             hidden_states = self.vocab_embedding(input_ids)
 
-        # Pass sinks per layer if provided via kwargs
+        # Pass sinks per layer if provided via kwargs; otherwise attempt to use layer.attention.sinks
         sinks_dict: Optional[dict] = kwargs.get('attention_sinks_dict')
-        if sinks_dict is None:
-            hidden_states = self.layers.forward(hidden_states)
-        else:
-            for idx, layer in enumerate(self.layers):
-                sinks = sinks_dict.get(idx) if isinstance(sinks_dict, dict) else None
-                hidden_states = layer(hidden_states, attention_sinks=sinks)
+        for idx, layer in enumerate(self.layers):
+            sinks = None
+            if isinstance(sinks_dict, dict):
+                sinks = sinks_dict.get(idx)
+            if sinks is None and hasattr(layer.attention, 'sinks'):
+                param = getattr(layer.attention, 'sinks')
+                sinks = getattr(param, 'value', None) or getattr(param, 'data', None) or param
+            hidden_states = layer(hidden_states, attention_sinks=sinks)
         # apply final norm on last pp rank
         if hasattr(self, 'ln_f'):
             hidden_states = self.ln_f(hidden_states)
@@ -175,44 +190,43 @@ class GptOssForCausalLM(DecoderModelForCausalLM):
         super().__init__(config, transformer, lm_head)
 
         # Customize weight loader mapping for MoE to match gpt-oss converter keys
-        try:
-            for module in self.transformer.layers:
-                if hasattr(module.mlp, 'fc'):
+        for module in self.transformer.layers:
+            if hasattr(module.mlp, 'fc'):
+                # Update only the necessary entries to avoid clobbering NVFP4 mappings
+                mapping_dict = getattr(module.mlp.fc, 'tllm_to_externel_key_dict', None)
+                if isinstance(mapping_dict, dict):
+                    mapping_dict.update({
+                        "weight": "mlp.fc.weight",
+                        "bias": "mlp.fc.bias",
+                    })
+                else:
                     module.mlp.fc.tllm_to_externel_key_dict = {
-                        "weight": ["mlp.fc.weight", "mlp.fc.blocks"],
-                        "weights_block_scaling_factor":
-                        "mlp.fc.weights_block_scaling_factor",
-                        "weights_block_scaling_factor_interleaved":
-                        "mlp.fc.weights_block_scaling_factor_interleaved",
-                        "activation_global_scaling_factor":
-                        "mlp.fc.activation_global_scaling_factor",
-                        "alpha": "mlp.fc.alpha",
+                        "weight": "mlp.fc.weight",
                         "bias": "mlp.fc.bias",
                     }
-                if hasattr(module.mlp, 'proj'):
+            if hasattr(module.mlp, 'proj'):
+                # Update only the necessary entries to avoid clobbering NVFP4 mappings
+                mapping_dict = getattr(module.mlp.proj, 'tllm_to_externel_key_dict', None)
+                if isinstance(mapping_dict, dict):
+                    mapping_dict.update({
+                        "weight": "mlp.proj.weight",
+                        "bias": "mlp.proj.bias",
+                    })
+                else:
                     module.mlp.proj.tllm_to_externel_key_dict = {
-                        "weight": ["mlp.proj.weight", "mlp.proj.blocks"],
-                        "weights_block_scaling_factor":
-                        "mlp.proj.weights_block_scaling_factor",
-                        "weights_block_scaling_factor_interleaved":
-                        "mlp.proj.weights_block_scaling_factor_interleaved",
-                        "activation_global_scaling_factor":
-                        "mlp.proj.activation_global_scaling_factor",
-                        "alpha": "mlp.proj.alpha",
+                        "weight": "mlp.proj.weight",
                         "bias": "mlp.proj.bias",
                     }
-                if hasattr(module.mlp, 'router'):
-                    module.mlp.router.tllm_to_externel_key_dict = {
-                        "mlp": "mlp",
-                        "router": "mlp.router"
-                    }
-        except Exception:
-            pass
+            if hasattr(module.mlp, 'router'):
+                module.mlp.router.tllm_to_externel_key_dict = {
+                    "mlp": "mlp",
+                    "router": "mlp.router"
+                }
 
     @classmethod
     def from_hugging_face(
         cls,
-        hf_model_or_dir: Union[str, "transformers.PreTrainedModel"],
+        hf_model_or_dir,
         dtype: str = "auto",
         mapping=None,
         quant_config=None,
