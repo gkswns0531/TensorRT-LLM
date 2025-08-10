@@ -92,10 +92,8 @@ def convert_and_save(
     moe_mode = moe_export
     if moe_export == 'auto':
         arch = (target_arch or '').lower()
-        if arch in ('sm80', 'sm_80', 'a100', 'sm89', 'sm_89', 'l4'):
-            moe_mode = 'fp16'
-        else:
-            moe_mode = 'mxfp4'
+        # Default to MXFP4; users may explicitly request bf16/fp16
+        moe_mode = 'mxfp4'
     elif moe_export in ('mxfp4', 'bf16', 'fp16'):
         moe_mode = moe_export
 
@@ -106,6 +104,10 @@ def convert_and_save(
     if moe_mode == 'mxfp4':
         # Preserve caller-provided quant_config if any; otherwise set NVFP4
         quant_cfg = quant_config if quant_config is not None else QuantConfig(quant_algo=QuantAlgo.NVFP4)
+        config.quantization = quant_cfg
+    else:
+        # Float export path: use provided quant_config or default to NO_QUANT
+        quant_cfg = quant_config if quant_config is not None else QuantConfig(quant_algo=QuantAlgo.NO_QUANT)
         config.quantization = quant_cfg
     # Save initial config.json (may be overwritten after dimension inference)
     config.to_json_file(str(output / 'config.json'))
@@ -193,59 +195,54 @@ def convert_and_save(
                            scales: torch.Tensor,
                            *,
                            dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
+        """MXFP4 dequantization using exponent-coded scales (torch.ldexp-based).
+
+        blocks: [E, OUT, IN_bytes] or [E, OUT, IN_groups, PACK_bytes] (uint8)
+        scales: [E, OUT] or [E, OUT, IN_groups] or [E, OUT, IN_bytes] (u8/i32/f32)
+        Return: [E, OUT, IN]
         """
-        MXFP4 blocks+scales to FP 
-
-        Supported shapes:
-          - blocks: [E, OUT, IN/vec] (uint8)
-          - blocks: [E, OUT, IN/vec, PACK] (uint8)  # PACK size example: 16
-          - scales: [E, OUT, IN/vec] (FP32/FP16/BF16/UINT8)
-
-        Process overview:
-          1) Flatten blocks to byte units ([E, OUT, IN/vec * PACK_BYTES])
-          2) Unpack each byte to 4bit pairs (low/high) → length 2x
-          3) Broadcast scales to byte·nibble extended length
-          4) element-wise multiply, cast to target dtype
-        Result shape: [E, OUT, IN] (IN = IN/vec * PACK_BYTES * 2)
-        """
-        if blocks.dim() < 3 or scales.dim() < 3:
-            raise ValueError(
-                f"blocks/scales must be at least 3D, got blocks{tuple(blocks.shape)} scales{tuple(scales.shape)}"
-            )
-
         if blocks.dim() == 4:
-            E, out_rows, in_cols, pack_bytes = blocks.shape
-            blocks_bytes = blocks.reshape(E, out_rows, in_cols * pack_bytes)
-            byte_repeat = pack_bytes
+            E, OUT, G, PACK = blocks.shape
+            rows_total = E * OUT * G
+            B = PACK
+            blk = blocks.reshape(rows_total, B)
+            if scales.dim() == 2 and scales.shape == (E, OUT):
+                exp = (scales.to(torch.int32) - 127).repeat_interleave(G, dim=0)
+                exp = exp.reshape(E * OUT, 1).repeat_interleave(B * 2, dim=1)
+            elif scales.dim() == 3 and scales.shape == (E, OUT, G):
+                exp = (scales.to(torch.int32) - 127).reshape(rows_total, 1).repeat(1, B * 2)
+            else:
+                raise ValueError(f"Unexpected scales shape for 4D blocks: {tuple(scales.shape)}")
+            lut = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+                                0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0], dtype=dtype)
+            idx_lo = (blk & 0x0F).to(torch.long)
+            idx_hi = (blk >> 4).to(torch.long)
+            out = torch.empty(rows_total, B * 2, dtype=dtype)
+            out[:, 0::2] = lut[idx_lo]
+            out[:, 1::2] = lut[idx_hi]
+            out = torch.ldexp(out, exp)
+            return out.reshape(E, OUT, G * B * 2)
         elif blocks.dim() == 3:
-            E, out_rows, in_cols = blocks.shape
-            blocks_bytes = blocks
-            byte_repeat = 1
+            E, OUT, B = blocks.shape
+            rows_total = E * OUT
+            blk = blocks.reshape(rows_total, B)
+            if scales.dim() == 2 and scales.shape == (E, OUT):
+                exp = (scales.to(torch.int32) - 127).reshape(rows_total, 1).repeat(1, B * 2)
+            elif scales.dim() == 3 and scales.shape[:2] == (E, OUT) and scales.shape[2] == B:
+                exp = (scales.to(torch.int32) - 127).reshape(rows_total, B).repeat_interleave(2, dim=1)
+            else:
+                raise ValueError(f"Unexpected scales shape for 3D blocks: {tuple(scales.shape)}")
+            lut = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+                                0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0], dtype=dtype)
+            idx_lo = (blk & 0x0F).to(torch.long)
+            idx_hi = (blk >> 4).to(torch.long)
+            out = torch.empty(rows_total, B * 2, dtype=dtype)
+            out[:, 0::2] = lut[idx_lo]
+            out[:, 1::2] = lut[idx_hi]
+            out = torch.ldexp(out, exp)
+            return out.reshape(E, OUT, B * 2)
         else:
-            leading = int(torch.tensor(blocks.shape[:-2]).prod().item())
-            blocks = blocks.reshape(leading, blocks.shape[-2], blocks.shape[-1])
-            E, out_rows, in_cols = blocks.shape
-            blocks_bytes = blocks
-            byte_repeat = 1
-
-        if scales.dtype not in (torch.float32, torch.float16, torch.bfloat16):
-            sf = scales.to(torch.float32) / 255.0
-        else:
-            sf = scales.to(torch.float32)
-
-        blk = blocks_bytes.view(torch.uint8)
-        low = (blk & 0x0F).to(torch.int8)
-        high = ((blk >> 4) & 0x0F).to(torch.int8)
-        low = (low ^ 0x08) - 0x08
-        high = (high ^ 0x08) - 0x08
-        
-        depacked = torch.stack([low, high], dim=-1).view(E, out_rows, -1)
-
-        sf = sf.unsqueeze(-1).repeat(1, 1, 1, byte_repeat * 2).view(
-            E, out_rows, -1)
-
-        deq = (depacked.to(torch.float32) * sf).to(dtype)
-        return deq
+            raise ValueError(f"Unsupported blocks dim: {blocks.dim()}")
 
     def _dequantize_mxfp4_streaming(blocks: torch.Tensor,
                                      scales: torch.Tensor,
@@ -348,14 +345,31 @@ def convert_and_save(
             logger.info(f"Adjusting num_key_value_heads from {config.num_key_value_heads} to {implied_kv_heads} based on k_proj.rows/head_size")
             config.num_key_value_heads = implied_kv_heads
 
-        # Infer intermediate_size from gate_up_proj_bias (expected = 2 * intermediate_size)
+        # Infer intermediate_size robustly from down_proj blocks (authoritative),
+        # falling back to gate_up_proj_bias only if needed. This matches actual proj.in_features.
         gub = get(f'model.layers.{i0}.mlp.experts.gate_up_proj_bias')
         if gub.shape[-1] % 2 != 0:
             raise ValueError(f"gate_up_proj_bias length {gub.shape[-1]} not even; cannot infer intermediate_size")
-        implied_inter = gub.shape[-1] // 2
-        if config.intermediate_size != implied_inter:
-            logger.info(f"Adjusting intermediate_size from {config.intermediate_size} to {implied_inter} based on gate_up_proj_bias")
-            config.intermediate_size = implied_inter
+        implied_inter_from_bias = gub.shape[-1] // 2
+
+        down0 = get(f'model.layers.{i0}.mlp.experts.down_proj_blocks')
+        if down0.dim() == 4:
+            # [E, OUT, IN/vec, PACK]
+            inferred_inter = down0.shape[2] * down0.shape[3] * 2
+        elif down0.dim() == 3:
+            # [E, OUT, IN/vec]
+            inferred_inter = down0.shape[2] * 2
+        else:
+            raise ValueError(f"Unexpected down_proj_blocks dim: {down0.dim()}")
+
+        if config.intermediate_size != inferred_inter:
+            logger.info(
+                f"Adjusting intermediate_size from {config.intermediate_size} to {inferred_inter} based on down_proj_blocks")
+            config.intermediate_size = inferred_inter
+        # Optional consistency check
+        if inferred_inter != implied_inter_from_bias:
+            logger.warning(
+                f"intermediate_size inferred from down_proj ({inferred_inter}) differs from gate_up_proj_bias/2 ({implied_inter_from_bias}); using down_proj value.")
 
         # Persist updated dimension config
         config.to_json_file(str(output / 'config.json'))
@@ -535,25 +549,22 @@ def convert_and_save(
                         weights[f'transformer.layers.{i}.mlp.fc.activation_global_scaling_factor'] = act_gsf
                         weights[f'transformer.layers.{i}.mlp.fc.alpha'] = alpha
                 else:
-                    # Offline dequantization to desired float dtype (bf16/fp16)
-                    assert deq_dtype is not None, f"Unsupported moe_mode {moe_mode}"
+                    # Offline dequantization to float (bf16/fp16)
+                    assert deq_dtype is not None
                     if tp_size == 1:
-                        fc_weight = _dequantize_mxfp4_streaming(fc_blocks, fc_scales, dtype=deq_dtype, tile_rows=stream_tile_rows)
-                        expected_in_fc = config.hidden_size
-                        if fc_weight.shape[-1] > expected_in_fc:
-                            fc_weight = fc_weight[..., :expected_in_fc]
+                        fc_weight = _dequantize_mxfp4(fc_blocks, fc_scales, dtype=deq_dtype)
+                        assert fc_weight.shape[-1] == config.hidden_size, \
+                            f"FC in_features {fc_weight.shape[-1]} != hidden_size {config.hidden_size}"
                         weights[f'transformer.layers.{i}.mlp.fc.weight'] = fc_weight.contiguous()
-                        weights[f'transformer.layers.{i}.mlp.fc.bias'] = fc_bias
+                        weights[f'transformer.layers.{i}.mlp.fc.bias'] = fc_bias.to(deq_dtype).contiguous()
                     else:
                         out_axis_blocks_tp = -3 if fc_blocks.dim() == 4 else -2
-                        fc_blocks_tp = torch.chunk(fc_blocks, tp_size, dim=out_axis_blocks_tp)[rank].contiguous()
-                        fc_scales_tp = torch.chunk(fc_scales, tp_size, dim=-2)[rank].contiguous()
-                        fc_bias_tp = torch.chunk(fc_bias, tp_size, dim=-1)[rank].contiguous()
-                        fc_weight_tp = _dequantize_mxfp4_streaming(fc_blocks_tp, fc_scales_tp, dtype=deq_dtype, tile_rows=stream_tile_rows)
-                        expected_in_fc_tp = config.hidden_size
-                        if fc_weight_tp.shape[-1] > expected_in_fc_tp:
-                            fc_weight_tp = fc_weight_tp[..., :expected_in_fc_tp]
-                        weights[f'transformer.layers.{i}.mlp.fc.weight'] = fc_weight_tp.contiguous()
+                        # Dequantize full then split along OUT axis
+                        fc_weight_full = _dequantize_mxfp4(fc_blocks, fc_scales, dtype=deq_dtype)
+                        fc_weight_tp = torch.chunk(fc_weight_full, tp_size, dim=1)[rank].contiguous()
+                        fc_bias_tp = torch.chunk(fc_bias.to(deq_dtype), tp_size, dim=-1)[rank].contiguous()
+                        assert fc_weight_tp.shape[-1] == config.hidden_size
+                        weights[f'transformer.layers.{i}.mlp.fc.weight'] = fc_weight_tp
                         weights[f'transformer.layers.{i}.mlp.fc.bias'] = fc_bias_tp
 
                 down_blocks = get(f'model.layers.{i}.mlp.experts.down_proj_blocks')
@@ -609,23 +620,17 @@ def convert_and_save(
                         weights[f'transformer.layers.{i}.mlp.proj.activation_global_scaling_factor'] = act_gsf
                         weights[f'transformer.layers.{i}.mlp.proj.alpha'] = alpha
                 else:
-                    assert deq_dtype is not None, f"Unsupported moe_mode {moe_mode}"
+                    assert deq_dtype is not None
+                    proj_weight = _dequantize_mxfp4(proj_blocks, proj_scales, dtype=deq_dtype)
+                    assert proj_weight.shape[-1] == config.intermediate_size, \
+                        f"PROJ in_features {proj_weight.shape[-1]} != intermediate_size {config.intermediate_size}"
                     if tp_size == 1:
-                        proj_weight = _dequantize_mxfp4_streaming(proj_blocks, proj_scales, dtype=deq_dtype, tile_rows=stream_tile_rows)
-                        expected_in = config.intermediate_size
-                        if proj_weight.shape[-1] > expected_in:
-                            proj_weight = proj_weight[..., :expected_in]
                         weights[f'transformer.layers.{i}.mlp.proj.weight'] = proj_weight.contiguous()
                         weights[f'transformer.layers.{i}.mlp.proj.bias'] = down_bias.to(deq_dtype).contiguous()
                     else:
-                        in_axis_blocks_tp = -2 if proj_blocks.dim() == 4 else -1
-                        proj_blocks_tp = torch.chunk(proj_blocks, tp_size, dim=in_axis_blocks_tp)[rank].contiguous()
-                        proj_scales_tp = torch.chunk(proj_scales, tp_size, dim=-1)[rank].contiguous()
-                        proj_weight_tp = _dequantize_mxfp4_streaming(proj_blocks_tp, proj_scales_tp, dtype=deq_dtype, tile_rows=stream_tile_rows)
-                        expected_in_tp = max(1, config.intermediate_size // tp_size)
-                        if proj_weight_tp.shape[-1] > expected_in_tp:
-                            proj_weight_tp = proj_weight_tp[..., :expected_in_tp]
-                        weights[f'transformer.layers.{i}.mlp.proj.weight'] = proj_weight_tp.contiguous()
+                        # Split along IN axis for RowLinear-like proj
+                        proj_weight_tp = torch.chunk(proj_weight, tp_size, dim=-1)[rank].contiguous()
+                        weights[f'transformer.layers.{i}.mlp.proj.weight'] = proj_weight_tp
                         weights[f'transformer.layers.{i}.mlp.proj.bias'] = down_bias.to(deq_dtype).contiguous()
 
                 # BF16 per-expert path intentionally not supported for gpt-oss (MoE uses MXFP4)
@@ -661,7 +666,8 @@ def convert_and_save(
             tensors = load_file(file)
             if name not in tensors:
                 continue
-            w = tensors[name].to(torch_dtype)
+            # Router runs in float32 for numerical stability and matches runtime cast
+            w = tensors[name].to(torch.float32)
             # keep unsplit; MOE handles distribution internally
             weights[f'transformer.layers.{i}.mlp.router.weight'] = w.contiguous()
 

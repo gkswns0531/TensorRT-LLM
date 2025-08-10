@@ -113,6 +113,9 @@ class _GptOssDecoderLayer(Module):
         
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
+        # Enforce layernorm output dtype to model dtype
+        if hasattr(self.config, 'dtype') and hasattr(hidden_states, 'dtype') and hidden_states.dtype != self.config.dtype:
+            hidden_states = cast(hidden_states, self.config.dtype)
 
         # try to pass sinks if attention supports it; otherwise fallback
         attn_out = None
@@ -140,11 +143,17 @@ class _GptOssDecoderLayer(Module):
 
         residual = hidden_states
         hidden_states = self.post_layernorm(hidden_states)
+        # Enforce layernorm output dtype to model dtype
+        if hasattr(self.config, 'dtype') and hasattr(hidden_states, 'dtype') and hidden_states.dtype != self.config.dtype:
+            hidden_states = cast(hidden_states, self.config.dtype)
+        # Router FP32 path is handled inside MOE; keep experts on model dtype here
         mlp_out = self.mlp(hidden_states, lora_layer_params=lora_layer_params)
+        # Cast back to model dtype immediately after MoE (safety for plugin reorderings)
+        mlp_out = cast(mlp_out, self.config.dtype)
 
-        # Align dtype before residual add
-        if hasattr(hidden_states, 'dtype') and hasattr(mlp_out, 'dtype') and hidden_states.dtype != mlp_out.dtype:
-            mlp_out = cast(mlp_out, hidden_states.dtype)
+        # Align dtype before residual add (match residual's dtype to avoid builder reordering issues)
+        if hasattr(residual, 'dtype') and hasattr(mlp_out, 'dtype') and residual.dtype != mlp_out.dtype:
+            mlp_out = cast(mlp_out, residual.dtype)
 
         hidden_states = residual + mlp_out
         return hidden_states
@@ -282,6 +291,9 @@ class GptOssForCausalLM(DecoderModelForCausalLM):
                     "mlp": "mlp",
                     "router": "mlp.router"
                 }
+                # Enforce router to run in float32 for numerical stability and
+                # to match FP32 routing logits casting
+                module.mlp.router.dtype = 'float32'
 
     @classmethod
     def from_hugging_face(
