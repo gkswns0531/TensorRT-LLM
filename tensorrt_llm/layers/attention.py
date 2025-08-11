@@ -403,8 +403,7 @@ class Attention(Module):
                  cp_rank=0,
                  max_seqlen_for_logn_scaling=8192,
                  use_logn_scaling=False,
-                 is_local=False,
-                 attention_sinks: Optional[Tensor] = None):
+                 is_local=False):
         super().__init__()
 
         self.local_layer_idx = local_layer_idx
@@ -581,23 +580,6 @@ class Attention(Module):
             self.clip_qkv = None
 
         self.skip_cross_kv = skip_cross_kv
-        # optional attention sinks per head
-        self.register_parameter('sinks', None)
-        if attention_sinks is not None:
-            try:
-                self.sinks = Parameter(attention_sinks, dtype='float32')
-            except Exception:
-                pass
-
-    def _get_sink_token_length(self):
-        # sinks shape: [num_heads_per_rank]
-        if hasattr(self, 'sinks') and self.sinks is not None:
-            try:
-                # non-zero indicates sink enabled; use scalar length = 1
-                return 1
-            except Exception:
-                return 0
-        return 0
 
     @staticmethod
     def create_attention_const_params(model_cls, config):
@@ -1146,7 +1128,7 @@ class Attention(Module):
                 host_past_key_value_lengths,
                 host_max_attention_window_sizes=kv_cache_params.
                 host_max_attention_window_sizes,
-                host_sink_token_length=kv_cache_params.host_sink_token_length if hasattr(kv_cache_params, 'host_sink_token_length') and kv_cache_params.host_sink_token_length is not None else constant(int32_array(self._get_sink_token_length())),
+                host_sink_token_length=kv_cache_params.host_sink_token_length,
                 context_lengths=attention_params.context_lengths,
                 cache_indirection=kv_cache_params.cache_indirection,
                 host_request_types=attention_params.host_request_types,

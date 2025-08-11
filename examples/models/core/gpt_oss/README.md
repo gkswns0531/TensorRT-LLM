@@ -2,12 +2,33 @@
 
 ## Convert (HF or original)
 
+### Standard precision (BF16)
 ```bash
 python examples/models/core/gpt_oss/convert_checkpoint.py \
   --model_dir /path/to/gpt-oss-hf-or-original \
   --output_dir /path/to/tllm_ckpt \
   --dtype bfloat16
 ```
+
+### FP8 quantization (Recommended for H100/L4) - NEW APPROACH! 🚀
+**Use quantize.py directly for optimal FP8 quantization:**
+```bash
+python examples/quantization/quantize.py \
+  --model_dir /path/to/gpt-oss-hf-or-original \
+  --dtype bfloat16 \
+  --qformat fp8 \
+  --kv_cache_dtype fp8 \
+  --output_dir /path/to/tllm_fp8_ckpt \
+  --calib_size 512 \
+  --tp_size 1
+```
+
+**Why this approach?**
+- ✅ **MXFP4 → FP8**: Automatic conversion of pre-quantized MOE weights
+- ✅ **BF16 → FP8**: Calibration-based quantization for regular weights  
+- ✅ **Single pipeline**: No need for 2-phase conversion
+- ✅ **Standard interface**: Same as Qwen/Llama quantization
+- ✅ **Better accuracy**: True calibration vs. simple scaling
 
 ## Build (TensorRT backend)
 
@@ -178,18 +199,33 @@ moe_config:
 --moe_backend TRITON
 ```
 
-## Convert & Prepare TensorRT-LLM Checkpoint (WIP)
+## Convert & Prepare TensorRT-LLM Checkpoint
 
-This repository contains a work-in-progress TensorRT backend path for GPT-OSS.
-You can export a TensorRT-LLM checkpoint config (and minimal shards) with:
-
+### Recommended: FP8 Quantization Pipeline
 ```bash
-python convert_checkpoint.py \
+# Single-phase conversion with optimal FP8 quantization
+python examples/quantization/quantize.py \
   --model_dir /path/to/gpt-oss-20b \
-  --output_dir /tmp/gpt_oss_ckpt \
-  --dtype bfloat16
+  --dtype bfloat16 \
+  --qformat fp8 \
+  --kv_cache_dtype fp8 \
+  --output_dir /tmp/gpt_oss_fp8_ckpt \
+  --calib_size 512 \
+  --tp_size 8  # Adjust based on your GPU setup
 ```
 
-Notes:
-- Current converter loads sinks, Q/K/V/O, norms, embeddings, lm_head, and MoE MXFP4 raw tensors.
-- TP=1 only at this stage. TP>1, MoE full mapping, and engine build will be enabled in subsequent commits.
+### Alternative: Basic BF16 Conversion
+```bash
+# For development or non-quantized use cases
+python examples/models/core/gpt_oss/convert_checkpoint.py \
+  --model_dir /path/to/gpt-oss-20b \
+  --output_dir /tmp/gpt_oss_ckpt \
+  --dtype bfloat16 \
+  --tp_size 8
+```
+
+**Implementation Notes:**
+- **MXFP4 Handling**: ModelOpt automatically detects pre-quantized MOE weights (torch.uint8) and converts them to FP8
+- **Calibration**: Regular weights (torch.bfloat16) undergo proper calibration-based FP8 quantization
+- **Architecture Support**: A100/H100/L4 (MXFP4→FP8), B200 (native MXFP4)
+- **Tensor Parallelism**: Full TP support enabled

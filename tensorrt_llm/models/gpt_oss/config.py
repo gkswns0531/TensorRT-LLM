@@ -22,7 +22,6 @@ class GptOssConfig(PretrainedConfig):
         hidden_act: str = "silu",
         **kwargs,
     ) -> None:
-        # gpt-oss specific
         self.layer_types = layer_types or []
         self.attention_bias = attention_bias
         self.rope_theta = rope_theta
@@ -40,8 +39,6 @@ class GptOssConfig(PretrainedConfig):
         assert isinstance(moe, MoeConfig)
         self.moe = moe.validate()
 
-        # Ensure parent config receives hidden_act to avoid being reset to default ('gelu')
-        # Align logits_dtype with dtype by default for dtype unification across the model
         if 'logits_dtype' not in kwargs and 'dtype' in kwargs:
             kwargs['logits_dtype'] = kwargs['dtype']
         super().__init__(hidden_act=hidden_act, **kwargs)
@@ -64,7 +61,6 @@ class GptOssConfig(PretrainedConfig):
                 str(hf_config_or_dir), trust_remote_code=kwargs.pop("trust_remote_code", True)
             )
 
-        # HF schema
         num_experts = getattr(hf, "num_local_experts", None)
         experts_per_token = getattr(hf, "num_experts_per_tok", getattr(hf, "experts_per_token", 4))
         rope_scaling = getattr(hf, "rope_scaling", None)

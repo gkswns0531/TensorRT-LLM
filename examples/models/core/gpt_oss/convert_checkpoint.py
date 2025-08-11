@@ -13,6 +13,8 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.gpt_oss.config import GptOssConfig
 from tensorrt_llm.models.gpt_oss.convert import convert_and_save
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization import QuantAlgo
 
 
 def parse_arguments(args=None):
@@ -22,8 +24,8 @@ def parse_arguments(args=None):
     parser.add_argument("--output_dir", type=str, required=True,
                        help="Path to output TensorRT-LLM checkpoint directory")
     parser.add_argument("--dtype", type=str, default="float16",
-                       choices=["float16", "bfloat16", "float32"],
-                       help="Data type for conversion (default: float16)")
+                       choices=["auto", "float16", "bfloat16", "float32"],
+                       help="Data type for model weights and activations if not quantized (default: float16)")
     parser.add_argument("--tp_size", type=int, default=1,
                        help="Tensor parallelism size (default: 1)")
     parser.add_argument("--pp_size", type=int, default=1,
@@ -43,23 +45,21 @@ def parse_arguments(args=None):
                        help="Logging level")
     parser.add_argument("--verbose", action="store_true",
                        help="Enable verbose output")
+    
+    # Quantization arguments - For FP8, use quantize.py directly
+    parser.add_argument("--qformat", type=str, default=None,
+                       help="Quantization format (fp8, int4_wo, etc.). Note: For FP8, use quantize.py directly!")
+    parser.add_argument("--kv_cache_dtype", type=str, default=None,
+                       help="KV cache quantization. Note: For FP8, use quantize.py directly!")
 
-    # MXFP4/BF16/FP16 MoE export control
-    parser.add_argument("--moe_export", type=str, default="auto",
-                        choices=["auto", "mxfp4", "bf16", "fp16"],
-                        help="MoE export mode: 'mxfp4' keeps FP4 blocks and NVFP4 scales; 'bf16' dequantizes to BF16; 'fp16' dequantizes to FP16; 'auto' based on target_arch")
-    parser.add_argument("--target_arch", type=str, default=None,
-                        help="Target architecture hint (e.g., sm80, a100, sm89, l4, sm100, h100, b200). Used when moe_export=auto")
-
-    # Advanced options
-    parser.add_argument("--nvfp4_scale_mode", type=str, default="heuristic",
-                        choices=["heuristic", "ones", "auto"],
-                        help="NVFP4 aux scale generation mode for MXFP4 export")
-    parser.add_argument("--stream_tile_rows", type=int, default=1024,
-                        help="Tile rows for streaming dequant when exporting BF16")
-    parser.add_argument("--interleave_scales", action="store_true",
-                        help="If set, interleave NVFP4 scales at convert-time (else loader interleaves)")
     return parser.parse_args(args)
+
+
+def args_to_quant_config(args: argparse.Namespace) -> QuantConfig:
+    """Create default quantization config (no quantization in Phase 1)"""
+    # Phase 1: No quantization, just BF16 checkpoint with MXFP4 dequantized
+    # Phase 2: quantize.py will handle FP8 quantization
+    return QuantConfig()
 
 
 def convert_checkpoint(args):
@@ -80,6 +80,10 @@ def convert_checkpoint(args):
     logger.info(f"Tensor parallelism: {args.tp_size}")
     logger.info(f"Pipeline parallelism: {args.pp_size}")
     logger.info(f"Workers: {args.workers}")
+    logger.info("Phase 1: Creating BF16 checkpoint (quantization in Phase 2)")
+    
+    # Create quantization config
+    quant_config = args_to_quant_config(args)
     
     start_time = time.time()
     
@@ -120,12 +124,7 @@ def convert_checkpoint(args):
             model_dir=str(model_dir),
             output_dir=str(output_dir),
             config=config,
-            quant_config=None,
-            moe_export=args.moe_export,
-            target_arch=args.target_arch,
-            nvfp4_scale_mode=args.nvfp4_scale_mode,
-            stream_tile_rows=args.stream_tile_rows,
-            interleave_scales=args.interleave_scales,
+            quant_config=quant_config,
         )
 
     end_time = time.time()

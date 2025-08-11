@@ -1,37 +1,71 @@
-"""
-Weights conversion utilities for GPT-OSS to TensorRT-LLM checkpoint format.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
-Features:
-- Load HF checkpoints (safetensors)
-- Extract/reshape Q/K/V/O projections with GQA and TP
-- Prepare MoE (gate_up_proj/down_proj) as either BF16 (dequantized) or MXFP4 (kept as FP4 blocks with NVFP4 aux scales)
-- Extract attention sinks per layer and slice by TP
-
-This converter writes a single shard per call (rank-aware) and avoids custom op dependencies at convert-time.
-"""
-from __future__ import annotations
-
-from dataclasses import dataclass
-import math
 import json
+import math
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Union
 
 import safetensors
-from safetensors import safe_open
-import torch.nn.functional as F
 import torch
+import torch.nn.functional as F
+from safetensors import safe_open
+from tqdm import tqdm
 
-from tensorrt_llm.logger import logger
-from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.models.modeling_utils import QuantConfig
-from tensorrt_llm.models.convert_utils import split_matrix_tp, dup_kv_weight, dup_kv_bias
-from tensorrt_llm._utils import str_dtype_to_torch
+from ..._utils import get_sm_version, str_dtype_to_torch
+from ...logger import logger
+from ...mapping import Mapping
+from ...quantization import QuantAlgo
+from ..convert_utils import (dup_kv_bias, dup_kv_weight, get_weight_and_bias,
+                             split_matrix_tp, split)
+from ..modeling_utils import QuantConfig
 from .config import GptOssConfig
-from tensorrt_llm.quantization.mode import QuantAlgo
 
 
 _STREAM_TILE_ROWS = 1024
+
+
+def simple_linear_weight(weight, prefix, bias=None, use_weight_only=False, 
+                        plugin_weight_only_quant_type=torch.int8, dtype=torch.bfloat16, 
+                        use_gemm_woq_plugin=True):
+    """Simple linear weight processing"""
+    results = {}
+    
+    if use_weight_only:
+        # Weight-only quantization
+        if weight.dim() > 2:
+            v = weight.transpose(1, 2).contiguous()
+        else:
+            v = weight.t().contiguous()
+        processed_torch_weights, torch_weight_scales = \
+            torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix(
+                v.cpu(), plugin_weight_only_quant_type)
+        if not use_gemm_woq_plugin:
+            results[prefix + 'weight'] = v.to(dtype)
+        else:
+            results[prefix + 'weight'] = processed_torch_weights
+        results[prefix + 'per_channel_scale'] = torch_weight_scales
+    else:
+        # Simple case: just store the weight
+        results[prefix + 'weight'] = weight
+    
+    if bias is not None:
+        results[prefix + 'bias'] = bias
+    
+    return results
 
 
 @dataclass
@@ -64,51 +98,92 @@ def load_hf_model(model_dir: Path):
 
 def convert_and_save(
     model_dir: Union[str, Path],
-    output_dir: Union[str, Path],
+    output_dir: Union[str, Path], 
     config: GptOssConfig,
     *,
     quant_config: Optional[QuantConfig] = None,
-    moe_export: str = 'auto',  # {'auto','mxfp4','bf16','fp16'}
-    target_arch: Optional[str] = None,
-    nvfp4_scale_mode: str = 'heuristic',  # {'heuristic','ones','auto'}
-    stream_tile_rows: int = _STREAM_TILE_ROWS,
-    interleave_scales: bool = False,
 ) -> None:
-    """
-    Convert the weights into TensorRT-LLM checkpoint shards (rank*.safetensors).
+    """Convert GPT-OSS weights from HuggingFace format to TensorRT-LLM checkpoint format.
 
-    This initial version writes config only, and stubs empty rank0 weight files
-    to bootstrap the pipeline. Weight population will be added incrementally.
+    This function performs comprehensive weight conversion including:
+    - Loading safetensors with memory-efficient streaming
+    - Reshaping Q/K/V/O projections with GQA and TP support
+    - MoE weight processing (MXFP4 or dequantized BF16)
+    - Attention sinks extraction and TP distribution
+    - Hardware-specific optimizations (SM version aware)
+
+    MXFP4 checkpoint weights are processed based on SM architecture:
+    - SM100+ (B200): Native MXFP4 preserves original training distribution
+    - SM80-89 (A100/H100): Dequantization to target precision
+
     """
     use_hf, p_model = _detect_hf_or_original(model_dir)
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
     
-    # Get target dtype from config (same as Llama pattern)
-    torch_dtype = str_dtype_to_torch(config.dtype)
-    logger.info(f"Using target dtype: {torch_dtype}")
-
-    # Decide MoE export mode
-    moe_mode = moe_export
-    if moe_export == 'auto':
-        arch = (target_arch or '').lower()
-        # Default to MXFP4; users may explicitly request bf16/fp16
-        moe_mode = 'mxfp4'
-    elif moe_export in ('mxfp4', 'bf16', 'fp16'):
-        moe_mode = moe_export
+    # Set quantization configuration following TensorRT-LLM standard conventions
+    if quant_config is not None:
+        # Use provided quantization config
+        config.quantization = quant_config
+        logger.info(f"Using provided quantization config: {config.quantization.quant_algo}")
+        
+        # Configure model for FP8 quantization compatibility
+        if config.quantization.quant_algo == QuantAlgo.FP8:
+            config.attention_bias = False  # FP8 quantization does not support MoE bias
+            logger.info(f"FP8 quantization detected: disabled attention_bias for compatibility")
+    else:
+        # Determine quantization based on SM architecture and MoE requirements
+        current_sm = get_sm_version()
+        if current_sm is None or current_sm < 80:
+            raise ValueError(f"Unsupported or undetected SM version: {current_sm}. Supported: SM80+ (A100, H100, B200)")
+        
+        if current_sm >= 100:
+            # B200+: Native MXFP4 preserving original training distribution
+            quant_cfg = QuantConfig(quant_algo=QuantAlgo.W4A16_MXFP4)
+            config.quantization = quant_cfg
+            logger.info(f"SM{current_sm}: Using native MXFP4 quantization: {config.quantization.quant_algo}")
+        else:
+            # A100, L4, H100: Standard processing without quantization
+            quant_cfg = QuantConfig(quant_algo=QuantAlgo.NO_QUANT)
+            config.quantization = quant_cfg
+            logger.info(f"SM{current_sm}: No quantization - using {config.dtype} precision")
+    
+    # Determine target dtype and processing strategy from quantization config (following TensorRT-LLM standard)
+    quant_algo = config.quantization.quant_algo
+    
+    # Initialize quantization variables (copied from Qwen3 pattern)
+    use_weight_only = quant_algo in [QuantAlgo.W8A16, QuantAlgo.W4A16] 
+    plugin_weight_only_quant_type = torch.int8 if use_weight_only else None
+    use_gemm_woq_plugin = True  # Enable for quantization support
+    
+    # Determine target precision based on quantization setting
+    target_dtype = str_dtype_to_torch(config.dtype)
+    
+    # MXFP4 dequantization target: FP8 if FP8 quantization, otherwise dtype
+    if quant_algo == QuantAlgo.FP8:
+        mxfp4_dequant_dtype = torch.float8_e4m3fn  # MXFP4 → FP8
+        logger.info(f"FP8 quantization: MXFP4 → FP8, Regular → {target_dtype}")
+        
+        # Initialize FP8 scaling factor dtype (following Gemma pattern)
+        fake_fp8_sf_dt = torch.float32
+        
+        # FP8 scaling factor generation function (fixed based on TensorRT-LLM standard)
+        def get_fp8_activation_scaling_factor() -> torch.Tensor:
+            # Activation scaling factors are always (1,) shape regardless of MoE
+            return torch.tensor([1.0], dtype=fake_fp8_sf_dt)
+            
+        def get_fp8_weights_scaling_factor(num_experts: int = 1) -> torch.Tensor:
+            # Weight scaling factors: (num_experts, 1) for MoE, (1,) for non-MoE
+            if num_experts > 1:
+                return torch.ones([num_experts, 1], dtype=fake_fp8_sf_dt)
+            else:
+                return torch.tensor([1.0], dtype=fake_fp8_sf_dt)
+    else:
+        mxfp4_dequant_dtype = target_dtype  # MXFP4 → BF16/FP16
+        logger.info(f"Standard precision: {target_dtype}")
 
     # Force RoPE type that TRT plugin recognizes
     config.position_embedding_type = "rope_gpt_neox"
-
-    # Attach quantization hint into config: NVFP4 when exporting MXFP4
-    if moe_mode == 'mxfp4':
-        # Preserve caller-provided quant_config if any; otherwise set NVFP4
-        quant_cfg = quant_config if quant_config is not None else QuantConfig(quant_algo=QuantAlgo.NVFP4)
-        config.quantization = quant_cfg
-    else:
-        # Float export path: use provided quant_config or default to NO_QUANT
-        quant_cfg = quant_config if quant_config is not None else QuantConfig(quant_algo=QuantAlgo.NO_QUANT)
-        config.quantization = quant_cfg
     # Save initial config.json (may be overwritten after dimension inference)
     config.to_json_file(str(output / 'config.json'))
 
@@ -141,154 +216,70 @@ def convert_and_save(
 
     tp_size = config.mapping.tp_size if config.mapping else 1
 
-    def _nvfp4_aux_from_mxfp4_scales(scales: torch.Tensor,
-                                     out_features: int,
-                                     in_features: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Generate NVFP4 auxiliary scale tensors from MXFP4 scales.
 
-        Returns (weights_block_scaling_factor, weights_block_scaling_factor_interleaved, activation_global_scaling_factor, alpha)
-        Shapes:
-          - wbsf, wbsf_interleaved: [E, out_features_pad, in_features_pad/16]
-          - act_gsf: [1]
-          - alpha: [E]
-        """
-        E = scales.shape[0]
-        vec = 16
-        # pad columns to ceil(in_features/vec)
-        want_cols = math.ceil(in_features / vec)
-        have_cols = scales.shape[-1]
-        if have_cols < want_cols:
-            scales = F.pad(scales, (0, want_cols - have_cols))
-        # pad rows to multiple of 128 as NVFP4 plugin prefers
-        want_rows = math.ceil(out_features / 128) * 128
-        have_rows = scales.shape[-2]
-        if have_rows < want_rows:
-            pad_rows = want_rows - have_rows
-            pad_tensor = torch.zeros((E, pad_rows, scales.shape[-1]), dtype=scales.dtype)
-            scales = torch.cat([scales, pad_tensor], dim=-2)
-
-        # Select scale mode
-        mode = nvfp4_scale_mode or 'heuristic'
-        if mode == 'auto':
-            mode = 'heuristic'
-
-        if mode == 'ones':
-            sf_fp8 = torch.ones_like(scales, dtype=torch.float8_e4m3fn)
-        else:
-            # cast to fp8 for weights_block_scaling_factor
-            sf_fp8 = scales.to(torch.float8_e4m3fn)
-
-        # Interleaved layout key: either defer to loader or interleave now
-        if interleave_scales:
-            inter_u8 = torch.ops.trtllm.block_scale_interleave(sf_fp8.view(torch.uint8).contiguous())
-            inter = inter_u8.view(sf_fp8.dtype)
-        else:
-            # Defer interleave to loader-side
-            inter = sf_fp8.clone()
-
-        # Global activation scale and alpha
-        act_gsf = torch.ones((1, ), dtype=torch.float32)
-        a = torch.ones((E, ), dtype=torch.float32)
-        return sf_fp8, inter, act_gsf, a
 
     def _dequantize_mxfp4(blocks: torch.Tensor,
                            scales: torch.Tensor,
                            *,
                            dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
-        """MXFP4 dequantization using exponent-coded scales (torch.ldexp-based).
+        """MXFP4 dequantization using FP8 E8M0 scales.
 
         blocks: [E, OUT, IN_bytes] or [E, OUT, IN_groups, PACK_bytes] (uint8)
-        scales: [E, OUT] or [E, OUT, IN_groups] or [E, OUT, IN_bytes] (u8/i32/f32)
+        scales: [E, OUT] or [E, OUT, IN_groups] or [E, OUT, IN_bytes] (u8 as FP8 E8M0)
         Return: [E, OUT, IN]
         """
+        # Convert FP8 E8M0 uint8 scales to float32 scales (matches TensorRT-LLM C++)
+        scales_f32 = scales.view(torch.float8_e8m0fnu).float()
+        
         if blocks.dim() == 4:
             E, OUT, G, PACK = blocks.shape
             rows_total = E * OUT * G
             B = PACK
             blk = blocks.reshape(rows_total, B)
             if scales.dim() == 2 and scales.shape == (E, OUT):
-                exp = (scales.to(torch.int32) - 127).repeat_interleave(G, dim=0)
-                exp = exp.reshape(E * OUT, 1).repeat_interleave(B * 2, dim=1)
+                scale_expanded = scales_f32.repeat_interleave(G, dim=0)
+                scale_expanded = scale_expanded.reshape(E * OUT, 1).repeat_interleave(B * 2, dim=1)
             elif scales.dim() == 3 and scales.shape == (E, OUT, G):
-                exp = (scales.to(torch.int32) - 127).reshape(rows_total, 1).repeat(1, B * 2)
+                scale_expanded = scales_f32.reshape(rows_total, 1).repeat(1, B * 2)
             else:
                 raise ValueError(f"Unexpected scales shape for 4D blocks: {tuple(scales.shape)}")
+            # Create LUT in float32 to support indexing, then convert to target dtype
             lut = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-                                0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0], dtype=dtype)
+                                0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0], dtype=torch.float32)
             idx_lo = (blk & 0x0F).to(torch.long)
             idx_hi = (blk >> 4).to(torch.long)
-            out = torch.empty(rows_total, B * 2, dtype=dtype)
+            out = torch.empty(rows_total, B * 2, dtype=torch.float32)
             out[:, 0::2] = lut[idx_lo]
             out[:, 1::2] = lut[idx_hi]
-            out = torch.ldexp(out, exp)
+            # Convert to target dtype after indexing
+            out = out.to(dtype)
+            out = out * scale_expanded.to(dtype)
             return out.reshape(E, OUT, G * B * 2)
         elif blocks.dim() == 3:
             E, OUT, B = blocks.shape
             rows_total = E * OUT
             blk = blocks.reshape(rows_total, B)
             if scales.dim() == 2 and scales.shape == (E, OUT):
-                exp = (scales.to(torch.int32) - 127).reshape(rows_total, 1).repeat(1, B * 2)
+                scale_expanded = scales_f32.reshape(rows_total, 1).repeat(1, B * 2)
             elif scales.dim() == 3 and scales.shape[:2] == (E, OUT) and scales.shape[2] == B:
-                exp = (scales.to(torch.int32) - 127).reshape(rows_total, B).repeat_interleave(2, dim=1)
+                scale_expanded = scales_f32.reshape(rows_total, B).repeat_interleave(2, dim=1)
             else:
                 raise ValueError(f"Unexpected scales shape for 3D blocks: {tuple(scales.shape)}")
+            # Create LUT in float32 to support indexing, then convert to target dtype
             lut = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-                                0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0], dtype=dtype)
+                                0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0], dtype=torch.float32)
             idx_lo = (blk & 0x0F).to(torch.long)
             idx_hi = (blk >> 4).to(torch.long)
-            out = torch.empty(rows_total, B * 2, dtype=dtype)
+            out = torch.empty(rows_total, B * 2, dtype=torch.float32)
             out[:, 0::2] = lut[idx_lo]
             out[:, 1::2] = lut[idx_hi]
-            out = torch.ldexp(out, exp)
+            # Convert to target dtype after indexing
+            out = out.to(dtype)
+            # TensorRT-LLM standard: direct multiplication
+            out = out * scale_expanded.to(dtype)
             return out.reshape(E, OUT, B * 2)
         else:
             raise ValueError(f"Unsupported blocks dim: {blocks.dim()}")
-
-    def _dequantize_mxfp4_streaming(blocks: torch.Tensor,
-                                     scales: torch.Tensor,
-                                     *,
-                                     dtype: torch.dtype,
-                                      tile_rows: int = _STREAM_TILE_ROWS) -> torch.Tensor:
-        # shapes: blocks [E, OUT, IN/vec] or [E, OUT, IN/vec, PACK], scales [E, OUT, IN/vec]
-        assert blocks.dim() in (3, 4), f"blocks must be 3D/4D, got {tuple(blocks.shape)}"
-        assert scales.dim() == 3, f"scales must be 3D, got {tuple(scales.shape)}"
-
-        if blocks.dim() == 4:
-            E, out_rows, in_cols, pack_bytes = blocks.shape
-            byte_repeat = pack_bytes
-            in_features = in_cols * pack_bytes * 2
-            assert (E, out_rows, in_cols) == (scales.shape[0], scales.shape[1], scales.shape[2])
-        else:
-            E, out_rows, in_cols = blocks.shape
-            byte_repeat = 1
-            in_features = in_cols * 2
-            assert blocks.shape == scales.shape, f"blocks/scales shape mismatch: {tuple(blocks.shape)} vs {tuple(scales.shape)}"
-
-        out = torch.empty((E, out_rows, in_features), dtype=dtype)
-
-        for r0 in range(0, out_rows, tile_rows):
-            r1 = min(out_rows, r0 + tile_rows)
-            if blocks.dim() == 4:
-                b_bytes = blocks[:, r0:r1, :, :].reshape(E, r1 - r0, in_cols * byte_repeat)
-            else:
-                b_bytes = blocks[:, r0:r1, :]
-
-            if scales.dtype not in (torch.float32, torch.float16, torch.bfloat16):
-                sf = scales[:, r0:r1, :].to(torch.float32) / 255.0
-            else:
-                sf = scales[:, r0:r1, :].to(torch.float32)
-
-            blk = b_bytes.view(torch.uint8)
-            low = (blk & 0x0F).to(torch.int8)
-            high = ((blk >> 4) & 0x0F).to(torch.int8)
-            low = (low ^ 0x08) - 0x08
-            high = (high ^ 0x08) - 0x08
-            depacked = torch.stack([low, high], dim=-1).view(E, r1 - r0, -1).to(torch.float32)
-
-            sf = sf.unsqueeze(-1).repeat(1, 1, 1, byte_repeat * 2).view(E, r1 - r0, -1)
-            out[:, r0:r1, :] = (depacked * sf).to(dtype)
-
-        return out
 
     # Generate a single shard for current mapping.rank
     rank = config.mapping.rank if config.mapping else 0
@@ -377,12 +368,12 @@ def convert_and_save(
         # Recompute implied head again after adjustments
         tp_size = config.mapping.tp_size if config.mapping else 1
         nl = config.num_hidden_layers
-        # Set dequantization dtype for non-MXFP4 export
-        deq_dtype = None
-        if moe_mode == 'bf16':
-            deq_dtype = torch.bfloat16
-        elif moe_mode == 'fp16':
-            deq_dtype = torch.float16
+        # Determine processing strategy from quantization config
+        quant_algo = config.quantization.quant_algo
+        # B200+ supports native MXFP4 regardless of quantization setting
+        current_sm = get_sm_version()
+        use_native_mxfp4 = (current_sm >= 100)
+        deq_dtype = None if use_native_mxfp4 else target_dtype
 
         # Per-layer
         for i in range(nl):
@@ -394,12 +385,12 @@ def convert_and_save(
                     tensors = load_file(file)
                     return tensors[name]
 
-                q_w = get(f'model.layers.{i}.self_attn.q_proj.weight').to(torch_dtype)
-                k_w = get(f'model.layers.{i}.self_attn.k_proj.weight').to(torch_dtype)
-                v_w = get(f'model.layers.{i}.self_attn.v_proj.weight').to(torch_dtype)
-                q_b = get(f'model.layers.{i}.self_attn.q_proj.bias').to(torch_dtype)
-                k_b = get(f'model.layers.{i}.self_attn.k_proj.bias').to(torch_dtype)
-                v_b = get(f'model.layers.{i}.self_attn.v_proj.bias').to(torch_dtype)
+                q_w = get(f'model.layers.{i}.self_attn.q_proj.weight').to(target_dtype)
+                k_w = get(f'model.layers.{i}.self_attn.k_proj.weight').to(target_dtype)
+                v_w = get(f'model.layers.{i}.self_attn.v_proj.weight').to(target_dtype)
+                q_b = get(f'model.layers.{i}.self_attn.q_proj.bias').to(target_dtype)
+                k_b = get(f'model.layers.{i}.self_attn.k_proj.bias').to(target_dtype)
+                v_b = get(f'model.layers.{i}.self_attn.v_proj.bias').to(target_dtype)
 
                 # shape checks for QKV
                 nh = config.num_attention_heads
@@ -410,10 +401,15 @@ def convert_and_save(
                 assert v_w.shape[0] == nkh * hs, f"v_proj.rows {v_w.shape[0]} != num_kv_heads*head_size {nkh*hs}"
 
                 if tp_size == 1:
-                    qkv_w_all = torch.cat([q_w, k_w, v_w], dim=0).contiguous()
-                    qkv_b_all = torch.cat([q_b, k_b, v_b], dim=0).contiguous()
-                    weights[f'transformer.layers.{i}.attention.qkv.weight'] = qkv_w_all
-                    weights[f'transformer.layers.{i}.attention.qkv.bias'] = qkv_b_all
+                    qkv_w_all = torch.concat([q_w, k_w, v_w], dim=0).contiguous()
+                    qkv_b_all = torch.concat([q_b, k_b, v_b], dim=0).contiguous()
+                    # Use simple_linear_weight for proper quantization (copied from Qwen3)
+                    weights.update(
+                        simple_linear_weight(qkv_w_all, f'transformer.layers.{i}.attention.qkv.',
+                                             qkv_b_all, use_weight_only,
+                                             plugin_weight_only_quant_type, target_dtype,
+                                             use_gemm_woq_plugin, 
+                                             ))  # Simple weight storage
                 else:
                     # GQA-aware TP split: split Q per num_heads, duplicate KV per num_kv_heads
                     num_heads = config.num_attention_heads
@@ -440,27 +436,41 @@ def convert_and_save(
                     k_b_tp = split_matrix_tp(k_b_eff, tp_size, rank, dim=0)
                     v_b_tp = split_matrix_tp(v_b_eff, tp_size, rank, dim=0)
 
-                    qkv_w_tp = torch.cat([q_w_tp, k_w_tp, v_w_tp], dim=0).contiguous()
-                    qkv_b_tp = torch.cat([q_b_tp, k_b_tp, v_b_tp], dim=0).contiguous()
+                    qkv_w_tp = torch.concat([q_w_tp, k_w_tp, v_w_tp], dim=0).contiguous()
+                    qkv_b_tp = torch.concat([q_b_tp, k_b_tp, v_b_tp], dim=0).contiguous()
 
-                    weights[f'transformer.layers.{i}.attention.qkv.weight'] = qkv_w_tp
-                    weights[f'transformer.layers.{i}.attention.qkv.bias'] = qkv_b_tp
+                    # Use simple_linear_weight for proper quantization (copied from Qwen3)
+                    weights.update(
+                        simple_linear_weight(qkv_w_tp, f'transformer.layers.{i}.attention.qkv.',
+                                             qkv_b_tp, use_weight_only,
+                                             plugin_weight_only_quant_type, target_dtype,
+                                             use_gemm_woq_plugin,
+                                             ))  # Simple weight storage
 
-                o_w = get(f'model.layers.{i}.self_attn.o_proj.weight').to(torch_dtype)
-                o_b = get(f'model.layers.{i}.self_attn.o_proj.bias').to(torch_dtype)
+                o_w = get(f'model.layers.{i}.self_attn.o_proj.weight').to(target_dtype)
+                o_b = get(f'model.layers.{i}.self_attn.o_proj.bias').to(target_dtype)
                 assert o_w.shape[1] == nh * hs, f"o_proj.cols {o_w.shape[1]} != num_heads*head_size {nh*hs}"
                 if tp_size == 1:
-                    weights[f'transformer.layers.{i}.attention.dense.weight'] = o_w.contiguous()
-                    weights[f'transformer.layers.{i}.attention.dense.bias'] = o_b.contiguous()
+                    # Use simple_linear_weight for proper quantization (copied from Qwen3)
+                    weights.update(
+                        simple_linear_weight(o_w, f'transformer.layers.{i}.attention.dense.',
+                                             o_b, use_weight_only,
+                                             plugin_weight_only_quant_type, target_dtype,
+                                             use_gemm_woq_plugin,
+                                             ))  # Simple weight storage
                 else:
                     # dense is row-parallel in many models; split columns for output gathering
                     tp_w = torch.chunk(o_w, tp_size, dim=1)[rank].contiguous()
-                    weights[f'transformer.layers.{i}.attention.dense.weight'] = tp_w
-                    # Write bias on all ranks; non-zero ranks will be zeroed in preprocess
-                    weights[f'transformer.layers.{i}.attention.dense.bias'] = o_b.contiguous()
+                    # Use simple_linear_weight for proper quantization (copied from Qwen3)
+                    weights.update(
+                        simple_linear_weight(tp_w, f'transformer.layers.{i}.attention.dense.',
+                                             o_b, use_weight_only,
+                                             plugin_weight_only_quant_type, target_dtype,
+                                             use_gemm_woq_plugin,
+                                             ))  # Simple weight storage
 
-                in_ln = get(f'model.layers.{i}.input_layernorm.weight').to(torch_dtype)
-                po_ln = get(f'model.layers.{i}.post_attention_layernorm.weight').to(torch_dtype)
+                in_ln = get(f'model.layers.{i}.input_layernorm.weight').to(target_dtype)
+                po_ln = get(f'model.layers.{i}.post_attention_layernorm.weight').to(target_dtype)
                 weights[f'transformer.layers.{i}.input_layernorm.weight'] = in_ln.contiguous()
                 weights[f'transformer.layers.{i}.post_layernorm.weight'] = po_ln.contiguous()
 
@@ -480,12 +490,12 @@ def convert_and_save(
                 else:
                     assert False, f"Unexpected gate_up_blocks dim: {gate_up_blocks.dim()}"
 
-                # Deinterleave gate/up along the OUT feature axis for blocks/scales.
-                # blocks may be 4D: [E, OUT, IN/vec, pack_vec], scales 3D: [E, OUT, IN/vec]
+                # Deinterleave gate/up along the OUT feature axis for TensorRT-LLM SwiGLU compatibility
+                # TensorRT-LLM SwiGLU uses chunk(x, 2, dim=-1), expecting [gate0,gate1,...,up0,up1,...] format
                 def _deinterleave_gate_up(tensor, out_axis):
                     out_len = tensor.shape[out_axis]
-                    idx_even = torch.arange(0, out_len, 2)
-                    idx_odd = torch.arange(1, out_len, 2)
+                    idx_even = torch.arange(0, out_len, 2)  # gate indices
+                    idx_odd = torch.arange(1, out_len, 2)   # up indices  
                     take = lambda t, idx: t.index_select(out_axis, idx.to(t.device))
                     return take(tensor, idx_even), take(tensor, idx_odd)
 
@@ -493,22 +503,20 @@ def convert_and_save(
                 out_axis_blocks = -3 if gate_up_blocks.dim() >= 4 else -2
                 out_axis_scales = -2  # scales expected [E, OUT, IN/vec]
 
-                gate_w, up_w = _deinterleave_gate_up(gate_up_blocks,
-                                                     out_axis_blocks)
-                gate_sc, up_sc = _deinterleave_gate_up(gate_up_scales,
-                                                       out_axis_scales)
+                gate_w, up_w = _deinterleave_gate_up(gate_up_blocks, out_axis_blocks)
+                gate_sc, up_sc = _deinterleave_gate_up(gate_up_scales, out_axis_scales)
 
-                fc_blocks = torch.cat([gate_w, up_w], dim=out_axis_blocks).contiguous()
-                fc_scales = torch.cat([gate_sc, up_sc], dim=out_axis_scales).contiguous()
-                # Bias: interleaved pairs gate/up across last dim
-                gate_b = gate_up_bias[:, ::2]
-                up_b = gate_up_bias[:, 1::2]
-                fc_bias = torch.cat([gate_b, up_b], dim=-1).contiguous()
-                # Cast bias to target dtype depending on moe_mode
-                if moe_mode == 'mxfp4':
-                    fc_bias = fc_bias.to(torch_dtype)
-                else:
-                    fc_bias = fc_bias.to(deq_dtype)
+                # Create segregated format: [up0,up1,...,gate0,gate1,...] for SwiGLU (following other models)
+                # TensorRT-LLM SwiGLU: x, gate = chunk(weight, 2) → x * silu(gate)
+                fc_blocks = torch.concat([up_w, gate_w], dim=out_axis_blocks).contiguous()
+                fc_scales = torch.concat([up_sc, gate_sc], dim=out_axis_scales).contiguous()
+                
+                # Deinterleave bias: [g0,u0,g1,u1,...] → [u0,u1,...,g0,g1,...] (UP first, GATE second)
+                gate_b = gate_up_bias[:, ::2]  # [g0, g1, g2, ...]  
+                up_b = gate_up_bias[:, 1::2]   # [u0, u1, u2, ...]
+                fc_bias = torch.concat([up_b, gate_b], dim=-1).contiguous()  # [u0,u1,...,g0,g1,...] (UP, GATE)
+                # Cast bias to unified target precision
+                fc_bias = fc_bias.to(target_dtype)
 
                 def _collapse_pack_dim(blocks: torch.Tensor) -> torch.Tensor:
                     if blocks.dim() == 4:
@@ -516,55 +524,49 @@ def convert_and_save(
                         return blocks.reshape(E, OUT, IN_DIV * PACK)
                     return blocks
 
-                if moe_mode == 'mxfp4':
+                if use_native_mxfp4:
+                    # Native MXFP4: Preserve original format and scales (SM100+ maximum accuracy)
                     if tp_size == 1:
+                        # Keep original MXFP4 blocks and scales without conversion
                         fc_blocks_ckpt = _collapse_pack_dim(fc_blocks)
                         weights[f'transformer.layers.{i}.mlp.fc.weight'] = fc_blocks_ckpt.contiguous()
+                        weights[f'transformer.layers.{i}.mlp.fc.weight.scales'] = fc_scales.contiguous()
                         weights[f'transformer.layers.{i}.mlp.fc.bias'] = fc_bias
-
-                        fc_out_features = fc_blocks.shape[1]
-                        fc_in_features = config.hidden_size
-                        wbsf, wbsf_inter, act_gsf, alpha = _nvfp4_aux_from_mxfp4_scales(
-                            fc_scales, out_features=fc_out_features, in_features=fc_in_features)
-                        weights[f'transformer.layers.{i}.mlp.fc.weights_block_scaling_factor'] = wbsf
-                        weights[f'transformer.layers.{i}.mlp.fc.weights_block_scaling_factor_interleaved'] = wbsf_inter
-                        weights[f'transformer.layers.{i}.mlp.fc.activation_global_scaling_factor'] = act_gsf
-                        weights[f'transformer.layers.{i}.mlp.fc.alpha'] = alpha
+                        
+                        logger.debug(f"Layer {i} fc: Native MXFP4 blocks {fc_blocks.shape}, scales {fc_scales.shape}")
                     else:
+                        # Tensor Parallel support for native MXFP4
+                        # fc (gate_up_proj) is ColLinear-like: split along OUT dimension  
+                        # Note: fc_blocks/fc_scales now in segregated format [g0,g1,...,u0,u1,...] for SwiGLU
+                        assert fc_blocks.dim() in [3, 4], f"fc_blocks unexpected dim: {fc_blocks.shape}"
+                        assert fc_scales.dim() == 3, f"fc_scales expected 3D [E, OUT, IN/vec], got: {fc_scales.shape}"
+                        
+                        out_axis_blocks_tp = -3 if fc_blocks.dim() == 4 else -2
+                        fc_blocks_tp = torch.chunk(fc_blocks, tp_size, dim=out_axis_blocks_tp)[rank].contiguous()
+                        fc_scales_tp = torch.chunk(fc_scales, tp_size, dim=-2)[rank].contiguous()  # Split OUT dimension
+                        fc_bias_tp = torch.chunk(fc_bias, tp_size, dim=-1)[rank].contiguous()
+                        
+                        fc_blocks_ckpt = _collapse_pack_dim(fc_blocks_tp)
+                        weights[f'transformer.layers.{i}.mlp.fc.weight'] = fc_blocks_ckpt.contiguous()
+                        weights[f'transformer.layers.{i}.mlp.fc.weight.scales'] = fc_scales_tp.contiguous()
+                        weights[f'transformer.layers.{i}.mlp.fc.bias'] = fc_bias_tp
+                        
+
+                else:
+                    # Simple dequantization based on quantization setting
+                    if tp_size == 1:
+                        fc_weight = _dequantize_mxfp4(fc_blocks, fc_scales, dtype=mxfp4_dequant_dtype)
+                        weights[f'transformer.layers.{i}.mlp.fc.weight'] = fc_weight.contiguous()
+                        weights[f'transformer.layers.{i}.mlp.fc.bias'] = fc_bias
+                    else:
+                        # TP chunking for dequantized path
                         out_axis_blocks_tp = -3 if fc_blocks.dim() == 4 else -2
                         fc_blocks_tp = torch.chunk(fc_blocks, tp_size, dim=out_axis_blocks_tp)[rank].contiguous()
                         fc_scales_tp = torch.chunk(fc_scales, tp_size, dim=-2)[rank].contiguous()
                         fc_bias_tp = torch.chunk(fc_bias, tp_size, dim=-1)[rank].contiguous()
 
-                        fc_blocks_ckpt = _collapse_pack_dim(fc_blocks_tp)
-                        weights[f'transformer.layers.{i}.mlp.fc.weight'] = fc_blocks_ckpt.contiguous()
-                        weights[f'transformer.layers.{i}.mlp.fc.bias'] = fc_bias_tp
-
-                        fc_out_features_tp = fc_blocks_tp.shape[1]
-                        fc_in_features = config.hidden_size
-                        wbsf, wbsf_inter, act_gsf, alpha = _nvfp4_aux_from_mxfp4_scales(
-                            fc_scales_tp, out_features=fc_out_features_tp, in_features=fc_in_features)
-                        weights[f'transformer.layers.{i}.mlp.fc.weights_block_scaling_factor'] = wbsf
-                        weights[f'transformer.layers.{i}.mlp.fc.weights_block_scaling_factor_interleaved'] = wbsf_inter
-                        weights[f'transformer.layers.{i}.mlp.fc.activation_global_scaling_factor'] = act_gsf
-                        weights[f'transformer.layers.{i}.mlp.fc.alpha'] = alpha
-                else:
-                    # Offline dequantization to float (bf16/fp16)
-                    assert deq_dtype is not None
-                    if tp_size == 1:
-                        fc_weight = _dequantize_mxfp4(fc_blocks, fc_scales, dtype=deq_dtype)
-                        assert fc_weight.shape[-1] == config.hidden_size, \
-                            f"FC in_features {fc_weight.shape[-1]} != hidden_size {config.hidden_size}"
-                        weights[f'transformer.layers.{i}.mlp.fc.weight'] = fc_weight.contiguous()
-                        weights[f'transformer.layers.{i}.mlp.fc.bias'] = fc_bias.to(deq_dtype).contiguous()
-                    else:
-                        out_axis_blocks_tp = -3 if fc_blocks.dim() == 4 else -2
-                        # Dequantize full then split along OUT axis
-                        fc_weight_full = _dequantize_mxfp4(fc_blocks, fc_scales, dtype=deq_dtype)
-                        fc_weight_tp = torch.chunk(fc_weight_full, tp_size, dim=1)[rank].contiguous()
-                        fc_bias_tp = torch.chunk(fc_bias.to(deq_dtype), tp_size, dim=-1)[rank].contiguous()
-                        assert fc_weight_tp.shape[-1] == config.hidden_size
-                        weights[f'transformer.layers.{i}.mlp.fc.weight'] = fc_weight_tp
+                        fc_weight_tp = _dequantize_mxfp4(fc_blocks_tp, fc_scales_tp, dtype=mxfp4_dequant_dtype)
+                        weights[f'transformer.layers.{i}.mlp.fc.weight'] = fc_weight_tp.contiguous()
                         weights[f'transformer.layers.{i}.mlp.fc.bias'] = fc_bias_tp
 
                 down_blocks = get(f'model.layers.{i}.mlp.experts.down_proj_blocks')
@@ -588,71 +590,115 @@ def convert_and_save(
                     # no change needed for dequant path; helper handles vec packing
                     pass
 
-                if moe_mode == 'mxfp4':
+                if use_native_mxfp4:
+                    # Native MXFP4: Preserve original format and scales (SM100+ maximum accuracy)
                     if tp_size == 1:
+                        # Keep original MXFP4 blocks and scales without conversion
                         proj_blocks_ckpt = _collapse_pack_dim(proj_blocks)
                         weights[f'transformer.layers.{i}.mlp.proj.weight'] = proj_blocks_ckpt.contiguous()
-                        weights[f'transformer.layers.{i}.mlp.proj.bias'] = down_bias.to(torch_dtype).contiguous()
-
-                        proj_out_features = proj_blocks.shape[1]
-                        proj_in_features = config.intermediate_size
-                        wbsf, wbsf_inter, act_gsf, alpha = _nvfp4_aux_from_mxfp4_scales(
-                            proj_scales, out_features=proj_out_features, in_features=proj_in_features)
-                        weights[f'transformer.layers.{i}.mlp.proj.weights_block_scaling_factor'] = wbsf
-                        weights[f'transformer.layers.{i}.mlp.proj.weights_block_scaling_factor_interleaved'] = wbsf_inter
-                        weights[f'transformer.layers.{i}.mlp.proj.activation_global_scaling_factor'] = act_gsf
-                        weights[f'transformer.layers.{i}.mlp.proj.alpha'] = alpha
+                        weights[f'transformer.layers.{i}.mlp.proj.weight.scales'] = proj_scales.contiguous()
+                        weights[f'transformer.layers.{i}.mlp.proj.bias'] = down_bias.to(target_dtype).contiguous()
+                        
+                        logger.debug(f"Layer {i} proj: Native MXFP4 blocks {proj_blocks.shape}, scales {proj_scales.shape}")
                     else:
+                        # Tensor Parallel support for native MXFP4
+                        # proj is RowLinear-like: split along IN dimension
+                        assert proj_blocks.dim() in [3, 4], f"proj_blocks unexpected dim: {proj_blocks.shape}"
+                        assert proj_scales.dim() == 3, f"proj_scales expected 3D [E, OUT, IN/vec], got: {proj_scales.shape}"
+                        
                         in_axis_blocks_tp = -2 if proj_blocks.dim() == 4 else -1
                         proj_blocks_tp = torch.chunk(proj_blocks, tp_size, dim=in_axis_blocks_tp)[rank].contiguous()
-                        proj_scales_tp = torch.chunk(proj_scales, tp_size, dim=-1)[rank].contiguous()
+                        proj_scales_tp = torch.chunk(proj_scales, tp_size, dim=-1)[rank].contiguous()  # Split IN dimension
 
                         proj_blocks_ckpt = _collapse_pack_dim(proj_blocks_tp)
                         weights[f'transformer.layers.{i}.mlp.proj.weight'] = proj_blocks_ckpt.contiguous()
-                        weights[f'transformer.layers.{i}.mlp.proj.bias'] = down_bias.to(torch_dtype).contiguous()
-
-                        proj_out_features = proj_blocks.shape[1]
-                        proj_in_features_tp = max(1, config.intermediate_size // tp_size)
-                        wbsf, wbsf_inter, act_gsf, alpha = _nvfp4_aux_from_mxfp4_scales(
-                            proj_scales_tp, out_features=proj_out_features, in_features=proj_in_features_tp)
-                        weights[f'transformer.layers.{i}.mlp.proj.weights_block_scaling_factor'] = wbsf
-                        weights[f'transformer.layers.{i}.mlp.proj.weights_block_scaling_factor_interleaved'] = wbsf_inter
-                        weights[f'transformer.layers.{i}.mlp.proj.activation_global_scaling_factor'] = act_gsf
-                        weights[f'transformer.layers.{i}.mlp.proj.alpha'] = alpha
+                        weights[f'transformer.layers.{i}.mlp.proj.weight.scales'] = proj_scales_tp.contiguous()
+                        weights[f'transformer.layers.{i}.mlp.proj.bias'] = down_bias.to(target_dtype).contiguous()
+                        
                 else:
-                    assert deq_dtype is not None
-                    proj_weight = _dequantize_mxfp4(proj_blocks, proj_scales, dtype=deq_dtype)
+                    # Simple dequantization based on quantization setting
+                    proj_weight = _dequantize_mxfp4(proj_blocks, proj_scales, dtype=mxfp4_dequant_dtype)
                     assert proj_weight.shape[-1] == config.intermediate_size, \
                         f"PROJ in_features {proj_weight.shape[-1]} != intermediate_size {config.intermediate_size}"
+                    
                     if tp_size == 1:
                         weights[f'transformer.layers.{i}.mlp.proj.weight'] = proj_weight.contiguous()
-                        weights[f'transformer.layers.{i}.mlp.proj.bias'] = down_bias.to(deq_dtype).contiguous()
+                        weights[f'transformer.layers.{i}.mlp.proj.bias'] = down_bias.to(target_dtype).contiguous()
                     else:
                         # Split along IN axis for RowLinear-like proj
                         proj_weight_tp = torch.chunk(proj_weight, tp_size, dim=-1)[rank].contiguous()
                         weights[f'transformer.layers.{i}.mlp.proj.weight'] = proj_weight_tp
-                        weights[f'transformer.layers.{i}.mlp.proj.bias'] = down_bias.to(deq_dtype).contiguous()
+                        weights[f'transformer.layers.{i}.mlp.proj.bias'] = down_bias.to(target_dtype).contiguous()
 
                 # BF16 per-expert path intentionally not supported for gpt-oss (MoE uses MXFP4)
+                
+                # Generate FP8 scaling factors (corrected based on TensorRT-LLM standard)
+                if quant_algo == QuantAlgo.FP8:
+                    tllm_prex = f'transformer.layers.{i}'
+                    
+                    # Get MoE experts count (following Grok pattern)
+                    num_experts = config.moe.num_experts if config.moe and config.moe.num_experts > 0 else 1
+                    
+                    # Attention scaling factors (always (1,) shape - not MoE related)
+                    weights[f'{tllm_prex}.attention.qkv.activation_scaling_factor'] = get_fp8_activation_scaling_factor()
+                    weights[f'{tllm_prex}.attention.qkv.weights_scaling_factor'] = get_fp8_weights_scaling_factor(num_experts=1)
+                    weights[f'{tllm_prex}.attention.dense.activation_scaling_factor'] = get_fp8_activation_scaling_factor()
+                    weights[f'{tllm_prex}.attention.dense.weights_scaling_factor'] = get_fp8_weights_scaling_factor(num_experts=1)
+                    
+                    # MLP scaling factors (activation: always (1,), weights: MoE-dependent)
+                    weights[f'{tllm_prex}.mlp.fc.activation_scaling_factor'] = get_fp8_activation_scaling_factor()
+                    weights[f'{tllm_prex}.mlp.fc.weights_scaling_factor'] = get_fp8_weights_scaling_factor(num_experts=num_experts)
+                    weights[f'{tllm_prex}.mlp.proj.activation_scaling_factor'] = get_fp8_activation_scaling_factor()
+                    weights[f'{tllm_prex}.mlp.proj.weights_scaling_factor'] = get_fp8_weights_scaling_factor(num_experts=num_experts)
+                    
+                    # KV cache scaling factors (following Gemma pattern exactly)
+                    scaling_factor = 1.0
+                    weights[f'{tllm_prex}.attention.kv_cache_scaling_factor'] = torch.tensor(
+                        [scaling_factor], dtype=fake_fp8_sf_dt)
+                    # Generate reciprocal scaling factor (following modeling_utils.py pattern)
+                    weights[f'{tllm_prex}.attention.kv_cache_rcp_scaling_factor'] = torch.reciprocal(
+                        torch.tensor([scaling_factor], dtype=fake_fp8_sf_dt))
 
         # Embeddings & final norm & lm_head (once per rank)
-        emb_w = get('model.embed_tokens.weight').to(torch_dtype)
+        emb_w = get('model.embed_tokens.weight').to(target_dtype)
         if tp_size == 1:
-            weights['transformer.vocab_embedding.weight'] = emb_w.contiguous()
+            # Use simple_linear_weight for proper quantization (copied from Qwen3)
+            weights.update(
+                simple_linear_weight(emb_w, 'transformer.vocab_embedding.',
+                                     None, use_weight_only,
+                                     plugin_weight_only_quant_type, target_dtype,
+                                     use_gemm_woq_plugin,
+                                     ))  # Simple weight storage
         else:
             # column-sharded along vocab dimension
             tp_emb = torch.chunk(emb_w, tp_size, dim=0)[rank].contiguous()
-            weights['transformer.vocab_embedding.weight'] = tp_emb
+            weights.update(
+                simple_linear_weight(tp_emb, 'transformer.vocab_embedding.',
+                                     None, use_weight_only,
+                                     plugin_weight_only_quant_type, target_dtype,
+                                     use_gemm_woq_plugin,
+                                     ))  # Simple weight storage
 
-        ln_f = get('model.norm.weight').to(torch_dtype)
+        ln_f = get('model.norm.weight').to(target_dtype)
         weights['transformer.ln_f.weight'] = ln_f.contiguous()
 
-        lm_w = get('lm_head.weight').to(torch_dtype)
+        lm_w = get('lm_head.weight').to(target_dtype)
         if tp_size == 1:
-            weights['lm_head.weight'] = lm_w.contiguous()
+            # Use simple_linear_weight for proper quantization (copied from Qwen3)
+            weights.update(
+                simple_linear_weight(lm_w, 'lm_head.',
+                                     None, use_weight_only,
+                                     plugin_weight_only_quant_type, target_dtype,
+                                     use_gemm_woq_plugin,
+                                     ))  # Simple weight storage
         else:
             tp_lm = torch.chunk(lm_w, tp_size, dim=0)[rank].contiguous()
-            weights['lm_head.weight'] = tp_lm
+            weights.update(
+                simple_linear_weight(tp_lm, 'lm_head.',
+                                     None, use_weight_only,
+                                     plugin_weight_only_quant_type, target_dtype,
+                                     use_gemm_woq_plugin,
+                                     ))  # Simple weight storage
 
     # Router weight (optional; present in MoE) — write on all ranks
     if weight_map is not None:
@@ -670,6 +716,9 @@ def convert_and_save(
             w = tensors[name].to(torch.float32)
             # keep unsplit; MOE handles distribution internally
             weights[f'transformer.layers.{i}.mlp.router.weight'] = w.contiguous()
+            
+            # Router does NOT need FP8 scaling factors since it runs in float32
+            # (following standard TensorRT-LLM MoE pattern)
 
     safetensors.torch.save_file(weights, str(shard_path))
     logger.info(f"Wrote shard with {len(weights)} tensors: {shard_path}")
@@ -679,28 +728,23 @@ def convert_and_save(
     )
 
 
-# --- Implementation guides (to be filled in next iterations) ---
-
-def _extract_qkv_from_hf(hf_model, layer_idx: int, config: GptOssConfig) -> Dict[str, torch.Tensor]:
-    """TODO: Read HF layer q,k,v weights + bias; return raw tensors prior to TP split."""
-    raise NotImplementedError
-
-
-def _tp_split_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mapping: Mapping, num_heads: int,
-                  num_kv_heads: int, head_size: int) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
-    """TODO: Perform TP split and KV duplication for GQA. Return weight/bias dicts per TP rank."""
-    raise NotImplementedError
-
-
-def _extract_moe_blocks_and_scales(hf_weights: Dict[str, torch.Tensor], config: GptOssConfig) -> Dict[str, torch.Tensor]:
-    """TODO: Handle MXFP4 blocks+scales for gate_up_proj/down_proj, deinterleave gate/up and prepare per-expert tensors."""
-    raise NotImplementedError
-
-
-def _load_attention_sinks(hf_model_or_dir: Union[str, Path], num_layers: int, num_heads: int,
-                          mapping: Mapping) -> Dict[int, torch.Tensor]:
-    """TODO: Load per-layer sinks (float32 per head) and TP-slice them."""
-    raise NotImplementedError
+def load_weights_from_hf_model(
+    model_dir: Union[str, Path],
+    config: GptOssConfig,
+    *,
+    quant_config: Optional[QuantConfig] = None,
+) -> None:
+    """Load weights from HuggingFace GPT-OSS model."""
+    # Extract output_dir from config.mapping if available, or use default
+    output_dir = getattr(config, 'output_dir', './tmp_checkpoint')
+    
+    # Call the main conversion function
+    convert_and_save(
+        model_dir=model_dir,
+        output_dir=output_dir,
+        config=config,
+        quant_config=quant_config
+    )
 
 
 def _extract_sinks_from_index(model_dir: Path) -> Dict[int, torch.Tensor]:

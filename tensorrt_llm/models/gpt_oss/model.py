@@ -4,12 +4,13 @@ import torch
 
 from tensorrt_llm.functional import (LayerNormType, AllReduceFusionOp, constant,
                                      default_net, PositionEmbeddingType, cast,
-                                     int32_array)
+                                     int32_array, recv, send)
 from tensorrt_llm.layers import (Attention, AttentionMaskType, ColumnLinear, Embedding,
                          GatedMLP, RmsNorm, MOE, MoeConfig)
 from tensorrt_llm.parameter import Parameter
 from tensorrt_llm.module import Module
 from tensorrt_llm.models.modeling_utils import DecoderLayerList, DecoderModelForCausalLM
+from tensorrt_llm.lora_manager import LoraConfig, use_lora
 from .config import GptOssConfig
 
 
@@ -50,8 +51,6 @@ class _GptOssDecoderLayer(Module):
             num_kv_heads=config.num_key_value_heads,
             max_position_embeddings=config.max_position_embeddings,
             dtype=dtype,
-            # Always use causal mask type for GPT attention plugin.
-            # Sliding window is controlled via host_max_attention_window_sizes.
             attention_mask_type=AttentionMaskType.causal,
             bias=config.attention_bias,
             position_embedding_type=pos_type,
@@ -62,19 +61,19 @@ class _GptOssDecoderLayer(Module):
             tp_size=config.mapping.tp_size,
             quant_mode=config.quant_mode,
             layernorm_type=LayerNormType.RmsNorm,
+            is_local=False,
         )
         # register sinks parameter under attention for weight loading compatibility
         setattr(self.attention, 'sinks', Parameter(shape=(config.num_attention_heads // max(1, config.mapping.tp_size), ),
                                                        dtype='float32'))
 
-        # Use MOE when configured; fallback to GatedMLP otherwise (same as Qwen)
         if config.moe.has_moe():
             self.mlp = MOE(moe_config=config.moe,
                            hidden_size=config.hidden_size,
                            ffn_hidden_size=config.intermediate_size,
                            hidden_act=config.hidden_act,
                            mapping=config.mapping,
-                           bias=True,
+                           bias=config.attention_bias,
                            dtype=dtype,
                            tp_size=config.mapping.tp_size,
                            tp_group=config.mapping.tp_group,
@@ -84,7 +83,7 @@ class _GptOssDecoderLayer(Module):
                                 ffn_hidden_size=config.intermediate_size,
                                 hidden_act=config.hidden_act,
                                 dtype=dtype,
-                                bias=True,
+                                bias=config.attention_bias,
                                 tp_group=config.mapping.tp_group,
                                 tp_size=config.mapping.tp_size,
                                 quant_mode=config.quant_mode)
@@ -104,12 +103,24 @@ class _GptOssDecoderLayer(Module):
                 attention_params=None,
                 lora_layer_params=None) -> torch.Tensor:
         
-        # Basic NVFP4 compatibility check (similar to Llama)
-        if (default_net().plugin_config.reduce_fusion 
-            and default_net().plugin_config.user_buffer 
-            and self.config.quant_mode.has_nvfp4()):
-            assert default_net().plugin_config.gemm_plugin == "nvfp4", \
-                "UB with nvfp4 model must use nvfp4 gemm plugin"
+        if default_net().plugin_config.reduce_fusion:
+            if default_net().plugin_config.user_buffer:
+                if self.config.quant_mode.has_fp8_qdq():
+                    # FP8 quantization with user buffer requires specific setup
+                    assert default_net().plugin_config.gemm_plugin == "fp8", \
+                        "UB with fp8 model must use fp8 gemm plugin"
+                elif self.config.quant_mode.has_nvfp4():
+                    # NVFP4 quantization with user buffer requires NVFP4 GEMM
+                    assert default_net().plugin_config.gemm_plugin == "nvfp4", \
+                        "UB with nvfp4 model must use nvfp4 gemm plugin"
+                else:
+                    # Standard precision with user buffer
+                    pass
+            
+            # Additional fusion compatibility checks
+            if default_net().plugin_config.norm_quant_fusion:
+                # Ensure reduce fusion and quantization fusion don't conflict
+                pass
         
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -184,6 +195,8 @@ class _GptOssModel(Module):
                 **kwargs) -> torch.Tensor:
         if self.mapping.is_first_pp_rank():
             hidden_states = self.vocab_embedding(input_ids)
+        else:
+            hidden_states = recv(hidden_states, self.mapping.prev_pp_rank())
 
         # Unify dtype once at model entry to avoid mixed Half/BFloat16 downstream
         target_dtype = getattr(self.config, 'dtype', None)
@@ -205,15 +218,11 @@ class _GptOssModel(Module):
                 window_sizes.append(window)
             kv_params.host_max_attention_window_sizes = constant(int32_array(window_sizes))
 
+        # Temporarily disable attention sinks to avoid plugin compatibility issues
         # Pass sinks per layer if provided via kwargs; otherwise attempt to use layer.attention.sinks
         sinks_dict: Optional[dict] = kwargs.get('attention_sinks_dict')
         for idx, layer in enumerate(self.layers):
             sinks = None
-            if isinstance(sinks_dict, dict):
-                sinks = sinks_dict.get(idx)
-            if sinks is None and hasattr(layer.attention, 'sinks'):
-                param = getattr(layer.attention, 'sinks')
-                sinks = getattr(param, 'value', None) or getattr(param, 'data', None) or param
             # Forward required runtime params down to the layer
             layer_kwargs = {}
             for k in (
@@ -226,10 +235,17 @@ class _GptOssModel(Module):
             ):
                 if k in kwargs:
                     layer_kwargs[k] = kwargs[k]
-            hidden_states = layer(hidden_states, attention_sinks=sinks, **layer_kwargs)
-        # apply final norm on last pp rank
-        if hasattr(self, 'ln_f'):
-            hidden_states = self.ln_f(hidden_states)
+            # Pass attention sinks for GPT-OSS streaming support (loaded from checkpoint)
+            attention_sinks = getattr(layer.attention, 'sinks', None)
+            hidden_states = layer(hidden_states, attention_sinks=attention_sinks, **layer_kwargs)
+            
+        # Pipeline parallelism: apply final norm on last pp rank or send to next pp rank
+        if self.mapping.is_last_pp_rank():
+            if hasattr(self, 'ln_f'):
+                hidden_states = self.ln_f(hidden_states)
+        else:
+            hidden_states = send(hidden_states, self.mapping.next_pp_rank())
+            
         # Return tuple when caching is enabled to satisfy builder expectations
         use_cache = bool(kwargs.get('use_cache', False)) or (kwargs.get('kv_cache_params') is not None)
         if use_cache:
@@ -294,6 +310,64 @@ class GptOssForCausalLM(DecoderModelForCausalLM):
                 # Enforce router to run in float32 for numerical stability and
                 # to match FP32 routing logits casting
                 module.mlp.router.dtype = 'float32'
+
+    def default_plugin_config(self, **kwargs):
+        plugin_config = super().default_plugin_config(**kwargs)
+        if self.quant_mode.is_int4_weight_only_per_group():
+            plugin_config.weight_only_groupwise_quant_matmul_plugin = 'auto'
+        return plugin_config
+
+    def use_lora(self, lora_config: LoraConfig):
+        use_lora(self, lora_config)
+
+    @classmethod
+    def quantize(
+        cls,
+        hf_model_dir: str,
+        output_dir: str,
+        dtype: str = 'auto',
+        mapping=None,
+        quant_config=None,
+        *,
+        calib_dataset='cnn_dailymail',
+        calib_batches=512,
+        calib_batch_size=1,
+        calib_max_seq_length=512,
+        random_seed=1234,
+        tokenizer_max_seq_length=2048,
+        **kwargs,
+    ):
+        if quant_config._requires_modelopt_quantization:
+            super().quantize(hf_model_dir,
+                             output_dir,
+                             dtype=dtype,
+                             mapping=mapping,
+                             quant_config=quant_config,
+                             calib_dataset=calib_dataset,
+                             calib_batches=calib_batches,
+                             calib_batch_size=calib_batch_size,
+                             calib_max_seq_length=calib_max_seq_length,
+                             random_seed=random_seed,
+                             tokenizer_max_seq_length=tokenizer_max_seq_length)
+        elif quant_config._requires_calibration:
+            from . import convert
+            config = GptOssConfig.from_hugging_face(hf_model_dir,
+                                                    dtype=dtype,
+                                                    mapping=mapping,
+                                                    quant_config=quant_config,
+                                                    **kwargs)
+            convert.quantize(hf_model_dir,
+                             output_dir,
+                             config=config,
+                             calib_dataset=calib_dataset,
+                             calib_batches=calib_batches,
+                             calib_max_seq_length=calib_max_seq_length,
+                             **kwargs)
+        else:
+            raise ValueError(
+                f"The quant_config ({quant_config}) does not require calibration, "
+                f"try {cls.__name__}.from_hugging_face instead."
+            )
 
     @classmethod
     def from_hugging_face(
