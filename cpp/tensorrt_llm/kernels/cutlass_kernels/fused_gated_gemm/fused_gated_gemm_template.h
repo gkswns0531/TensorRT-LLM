@@ -34,6 +34,7 @@
 #include "fused_gated_gemm.h"
 #include "single_gemm_kernel_template_sm80.h"
 #include "single_gemm_kernel_template_sm89.h"
+#include "single_gemm_kernel_template_sm89_fp8.h"
 #include "fused_gated_gemm_kernel_template_sm90.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/quantization.h"
@@ -369,18 +370,30 @@ size_t dispatchGemmConfigSm89(void* D, void const* A, void const* B, void const*
 {
     TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
     
-    // Convert TensorRT-LLM types to CUTLASS types
-    using ElementType = typename std::conditional_t<std::is_same_v<T, half>, cutlass::half_t, cutlass::bfloat16_t>;
+    // Convert TensorRT-LLM types to CUTLASS types (FP16, BF16, FP8)
+    using ElementType = typename std::conditional_t<
+        std::is_same_v<T, half>, cutlass::half_t,
+        std::conditional_t<std::is_same_v<T, __nv_bfloat16>, cutlass::bfloat16_t,
+                          cutlass::float_e4m3_t>>;
     using AccumElementType = float;
     
-    // Define CTA and Warp shapes 
+    // Define CTA and Warp shapes with FP8-optimized instruction shape for SM89
     using CTAShape = cutlass::gemm::GemmShape<CtaM, CtaN, CtaK>;
     using WarpShape = cutlass::gemm::GemmShape<WarpM, WarpN, WarpK>;
-    using InstructionShape = cutlass::gemm::GemmShape<16, 8, 16>; // SM89 표준 InstructionShape (DefaultGemmConfiguration 호환)
+    // FP8 uses 16x8x32 instruction shape, FP16/BF16 uses 16x8x16
+    using InstructionShape = typename std::conditional_t<
+        std::is_same_v<T, __nv_fp8_e4m3>, 
+        cutlass::gemm::GemmShape<16, 8, 32>,    // FP8 E4M3 optimized
+        cutlass::gemm::GemmShape<16, 8, 16>>;   // FP16/BF16 standard
     
-    // Use SM89 Single GEMM device with MoE-based fusion approach for L4
-    using DeviceKernel = DeviceGemmGatedSm89Single<ElementType, AccumElementType, CTAShape, WarpShape, 
-        cutlass::gemm::GemmShape<1, 1, 1>>;  // ClusterShape (SwapAB는 기본값 false 사용)
+    // Use SM89 Single GEMM device - FP8 specialized or general version
+    using DeviceKernel = typename std::conditional_t<
+        std::is_same_v<T, __nv_fp8_e4m3>,
+        DeviceGemmGatedSm89SingleFP8<ElementType, AccumElementType, CTAShape, WarpShape, 
+                                     cutlass::gemm::GemmShape<1, 1, 1>>,  // FP8 specialized
+        DeviceGemmGatedSm89Single<ElementType, AccumElementType, CTAShape, WarpShape, 
+                                  cutlass::gemm::GemmShape<1, 1, 1>>     // FP16/BF16 general
+    >;
     
     // Single GEMM SwiGLU 텐서 구성 - MoE 방식 적용 (SM89 = L4)
     cutlass::TensorRef<ElementType const, cutlass::layout::RowMajor> tensor_a(
@@ -451,9 +464,10 @@ size_t dispatchGemmToCutlassSm89(void* D, void const* A, void const* B, void con
 {
     TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
     
-    // Support FP16 and BF16 data types on SM89
-    static_assert(std::is_same_v<T, half> || std::is_same_v<T, __nv_bfloat16>, 
-                  "dispatchGemmToCutlassSm89 supports FP16 and BF16 only");
+    // Support FP16, BF16, and FP8 E4M3 data types on SM89 (L4)
+    static_assert(std::is_same_v<T, half> || std::is_same_v<T, __nv_bfloat16> || 
+                  std::is_same_v<T, __nv_fp8_e4m3>, 
+                  "dispatchGemmToCutlassSm89 supports FP16, BF16, and FP8 E4M3");
     
     // Follow fp8_rowwise_gemm pattern: dispatch to different tile configs
     switch (gemmConfig.tile_config_sm80)
