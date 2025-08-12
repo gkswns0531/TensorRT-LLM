@@ -33,7 +33,7 @@
 
 #include "fused_gated_gemm.h"
 #include "single_gemm_kernel_template_sm80.h"
-#include "fused_gated_gemm_kernel_template_sm89.h"
+#include "single_gemm_kernel_template_sm89.h"
 #include "fused_gated_gemm_kernel_template_sm90.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/quantization.h"
@@ -378,15 +378,15 @@ size_t dispatchGemmConfigSm89(void* D, void const* A, void const* B, void const*
     using WarpShape = cutlass::gemm::GemmShape<WarpM, WarpN, WarpK>;
     using InstructionShape = cutlass::gemm::GemmShape<16, 8, 16>; // SM89 표준 InstructionShape (DefaultGemmConfiguration 호환)
     
-    // Use SM89-dedicated device GEMM with 수정된 template signature (Activation parameter 제거)
-    using DeviceKernel = DeviceGemmGatedSm89<ElementType, AccumElementType, CTAShape, WarpShape, 
+    // Use SM89 Single GEMM device with MoE-based fusion approach for L4
+    using DeviceKernel = DeviceGemmGatedSm89Single<ElementType, AccumElementType, CTAShape, WarpShape, 
         cutlass::gemm::GemmShape<1, 1, 1>>;  // ClusterShape (SwapAB는 기본값 false 사용)
     
-    // 진정한 SwiGLU를 위한 DualGemm 텐서 구성 (SM89 = L4)
+    // Single GEMM SwiGLU 텐서 구성 - MoE 방식 적용 (SM89 = L4)
     cutlass::TensorRef<ElementType const, cutlass::layout::RowMajor> tensor_a(
         reinterpret_cast<ElementType const*>(A), cutlass::layout::RowMajor::packed({m, k}));
     
-    // B 매트릭스: DualGemm이 내부에서 [B_linear | B_gate]로 분할 처리  
+    // B 매트릭스: Single GEMM이 [B_linear | B_gate] concatenated 형태로 처리
     cutlass::TensorRef<ElementType const, cutlass::layout::ColumnMajor> tensor_b(
         reinterpret_cast<ElementType const*>(B), cutlass::layout::ColumnMajor::packed({k, n}));
     
@@ -397,16 +397,16 @@ size_t dispatchGemmConfigSm89(void* D, void const* A, void const* B, void const*
     cutlass::TensorRef<ElementType, cutlass::layout::RowMajor> tensor_d(
         reinterpret_cast<ElementType*>(D), cutlass::layout::RowMajor::packed({m, n/2}));
 
-    // DualGemm Arguments: B 매트릭스를 통째로 전달하고 내부에서 분할 처리
+    // Single GEMM Arguments: MoE 방식으로 single kernel + post-processing (SM89)
     typename DeviceKernel::Arguments arguments(
-        {m, n/2, k},                    // problem_size (SwiGLU 출력 크기)
-        tensor_a,                       // A 매트릭스
-        tensor_b,                       // B 매트릭스 전체 (내부에서 linear/gate 분할)
-        tensor_c,                       // C bias (1 x 2*n_out)
-        tensor_d,                       // D 출력
-        scale_d0,                       // alpha
-        /*beta_unused*/ 0.0f,           // beta는 DualGemm에서 미사용(최종 커널에서 bias 적용)
-        scale_output                    // output scale 적용
+        {m, n/2, k},                    // problem_size (final SwiGLU output size)
+        tensor_a,                       // A matrix
+        tensor_b,                       // B matrix contains [B_linear | B_gate] concatenated
+        tensor_c,                       // C bias (contains both linear and gate biases)
+        tensor_d,                       // D final output
+        scale_d0,                       // alpha for GEMM
+        0.0f,                          // beta (unused, bias applied in post-processing)
+        scale_output                    // output scale applied in SwiGLU activation kernel
     );
     
     DeviceKernel gemm_operator;
@@ -432,7 +432,7 @@ size_t dispatchGemmConfigSm89(void* D, void const* A, void const* B, void const*
     }
     
     // CUTLASS 2.x device::Gemm execution pattern: initialize + run  
-    // DualGemm execution: 내부에서 dual GEMM + SwiGLU 융합 실행
+    // Single GEMM execution: MoE 방식으로 single GEMM + SwiGLU 융합 실행 (SM89)
     status = gemm_operator.run(arguments, workspace, stream);
     if (status != cutlass::Status::kSuccess) {
         std::string error_msg = "[TensorRT-LLM Error][dispatchGemmConfigSm89] Kernel execution failed. Status: " 
