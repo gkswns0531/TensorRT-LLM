@@ -32,7 +32,7 @@
 #endif          // __GNUC
 
 #include "fused_gated_gemm.h"
-#include "fused_gated_gemm_kernel_template_sm80.h"
+#include "single_gemm_kernel_template_sm80.h"
 #include "fused_gated_gemm_kernel_template_sm89.h"
 #include "fused_gated_gemm_kernel_template_sm90.h"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -191,11 +191,11 @@ size_t dispatchGemmConfigSm80(void* D, void const* A, void const* B, void const*
     using WarpShape = cutlass::gemm::GemmShape<WarpM, WarpN, WarpK>;
     using InstructionShape = cutlass::gemm::GemmShape<16, 8, 16>; // SM80 표준 InstructionShape (DefaultGemmConfiguration 호환)
     
-    // Use SM80 device GEMM with 수정된 template signature (Activation parameter 제거)
-    using DeviceKernel = DeviceGemmGatedSm80<ElementType, AccumElementType, CTAShape, WarpShape,
+    // Use SM80 Single GEMM device with MoE-based fusion approach
+    using DeviceKernel = DeviceGemmGatedSm80Single<ElementType, AccumElementType, CTAShape, WarpShape,
         cutlass::gemm::GemmShape<1, 1, 1>>;  // ClusterShape (SwapAB는 기본값 false 사용)
     
-    // 진정한 SwiGLU를 위한 DualGemm 텐서 구성
+    // Single GEMM SwiGLU 텐서 구성 - MoE 방식 적용
     cutlass::TensorRef<ElementType const, cutlass::layout::RowMajor> tensor_a(
         reinterpret_cast<ElementType const*>(A), cutlass::layout::RowMajor::packed({m, k}));
     
