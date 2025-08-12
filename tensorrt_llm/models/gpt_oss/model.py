@@ -218,7 +218,6 @@ class _GptOssModel(Module):
                 window_sizes.append(window)
             kv_params.host_max_attention_window_sizes = constant(int32_array(window_sizes))
 
-        # Temporarily disable attention sinks to avoid plugin compatibility issues
         # Pass sinks per layer if provided via kwargs; otherwise attempt to use layer.attention.sinks
         sinks_dict: Optional[dict] = kwargs.get('attention_sinks_dict')
         for idx, layer in enumerate(self.layers):
