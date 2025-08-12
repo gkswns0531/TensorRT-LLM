@@ -83,7 +83,7 @@ DEFAULT_PLUGIN_DTYPE_OPTIONS = [
     "auto", "float16", "float32", "bfloat16", "int32", None
 ]
 PLUGIN_DTYPE_OPTIONS_MAP = {
-    "gemm_swiglu_plugin": ["fp8", None],
+    "gemm_swiglu_plugin": ["fp8", "fp16", "bf16", None],
     "gemm_plugin":
     ["auto", "float16", "float32", "bfloat16", "int32", "fp8", "nvfp4", None],
     "low_latency_gemm_plugin": ["fp8", None],
