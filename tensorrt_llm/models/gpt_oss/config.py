@@ -39,8 +39,9 @@ class GptOssConfig(PretrainedConfig):
         assert isinstance(moe, MoeConfig)
         self.moe = moe.validate()
 
-        if 'logits_dtype' not in kwargs and 'dtype' in kwargs:
-            kwargs['logits_dtype'] = kwargs['dtype']
+        # Always use float32 for logits to ensure TensorRT-LLM runtime compatibility
+        if 'logits_dtype' not in kwargs:
+            kwargs['logits_dtype'] = 'float32'
         super().__init__(hidden_act=hidden_act, **kwargs)
 
     @classmethod
