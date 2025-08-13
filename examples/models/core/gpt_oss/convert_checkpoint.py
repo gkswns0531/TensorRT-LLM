@@ -18,7 +18,7 @@ from tensorrt_llm.quantization import QuantAlgo
 
 
 def parse_arguments(args=None):
-    parser = argparse.ArgumentParser(description="Convert GPT-OSS model to TensorRT-LLM checkpoint")
+    parser = argparse.ArgumentParser(description="Convert GPT-OSS model to TensorRT-LLM checkpoint with native FP8 quantization support")
     parser.add_argument("--model_dir", type=str, required=True,
                        help="Path to the GPT-OSS model directory")
     parser.add_argument("--output_dir", type=str, required=True,
@@ -46,20 +46,37 @@ def parse_arguments(args=None):
     parser.add_argument("--verbose", action="store_true",
                        help="Enable verbose output")
     
-    # Quantization arguments - For FP8, use quantize.py directly
-    parser.add_argument("--qformat", type=str, default=None,
-                       help="Quantization format (fp8, int4_wo, etc.). Note: For FP8, use quantize.py directly!")
-    parser.add_argument("--kv_cache_dtype", type=str, default=None,
-                       help="KV cache quantization. Note: For FP8, use quantize.py directly!")
+    # FP8 quantization arguments
+    parser.add_argument("--use_fp8_qdq", action="store_true", default=False,
+                       help="Enable FP8 QDQ quantization (recommended for GPT-OSS MoE)")
+    parser.add_argument("--use_mxfp4_fp8", action="store_true", default=False,
+                       help="Enable MXFP4 + FP8 quantization (optimized for MoE models)")
+    parser.add_argument("--fp8_kv_cache", action="store_true", default=False,
+                       help="Enable FP8 KV cache quantization for memory efficiency")
 
     return parser.parse_args(args)
 
 
 def args_to_quant_config(args: argparse.Namespace) -> QuantConfig:
-    """Create default quantization config (no quantization in Phase 1)"""
-    # Phase 1: No quantization, just BF16 checkpoint with MXFP4 dequantized
-    # Phase 2: quantize.py will handle FP8 quantization
-    return QuantConfig()
+    """Create quantization config based on CLI arguments."""
+    quant_config = QuantConfig()
+    
+    # Configure FP8 QDQ quantization (recommended)
+    if args.use_fp8_qdq:
+        quant_config.quant_algo = QuantAlgo.FP8
+        quant_config.clamp_val = [-1200.0, 1200.0]  # Standard FP8 clamp values
+        logger.info("Enabled FP8 QDQ quantization (recommended for MoE models)")
+    # Configure MXFP4 + FP8 quantization
+    elif args.use_mxfp4_fp8:
+        quant_config.quant_algo = QuantAlgo.W4A8_MXFP4_FP8
+        logger.info("Enabled MXFP4 + FP8 quantization (optimized for MoE models)")
+    
+    # Configure FP8 KV cache
+    if args.fp8_kv_cache:
+        quant_config.kv_cache_quant_algo = QuantAlgo.FP8
+        logger.info("Enabled FP8 KV cache quantization")
+    
+    return quant_config
 
 
 def convert_checkpoint(args):
@@ -135,6 +152,8 @@ def convert_checkpoint(args):
     logger.info(f"  Model: {model_dir}")
     logger.info(f"  Output: {output_dir}")
     logger.info(f"  Data type: {args.dtype}")
+    logger.info(f"  MXFP4+FP8 quantization: {'Enabled' if args.use_mxfp4_fp8 else 'Disabled'}")
+    logger.info(f"  FP8 KV cache: {'Enabled' if args.fp8_kv_cache else 'Disabled'}")
     logger.info(f"  Parallelism: TP={args.tp_size}, PP={args.pp_size}")
     logger.info(f"  Total ranks: {world_size}")
 

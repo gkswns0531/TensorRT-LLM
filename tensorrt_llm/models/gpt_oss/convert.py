@@ -35,16 +35,56 @@ from ..modeling_utils import QuantConfig
 from .config import GptOssConfig
 
 
-_STREAM_TILE_ROWS = 1024
+def fp8_per_channel_quant_weight_gpu(weight, clamp_val, rank=0):
+    """FP8 per-channel quantization on GPU (ported from Llama)."""
+    weight = weight.to("cuda:" + str(rank))
+    # activation range bound.
+    x = weight.to(torch.float32).clamp(clamp_val[0], clamp_val[1])
+    xmax = x.abs().max(-1, keepdim=True).values
+    # minimum scaling factor.
+    torch_weight_scales = (xmax / 448.0).clamp(min=1.0 / (448.0 * 512.0))
+    out = x / torch_weight_scales
+    torch_weight_scales = torch_weight_scales.reshape(-1)
+    out = torch.clamp(out, -448, 448)
+    processed_torch_weights = out.to(torch.float8_e4m3fn)
+
+    processed_torch_weights = processed_torch_weights.to(
+        torch.float8_e4m3fn).cpu()
+    torch_weight_scales = torch_weight_scales.cpu()
+
+    return processed_torch_weights, torch_weight_scales
 
 
 def simple_linear_weight(weight, prefix, bias=None, use_weight_only=False, 
                         plugin_weight_only_quant_type=torch.int8, dtype=torch.bfloat16, 
-                        use_gemm_woq_plugin=True):
-    """Simple linear weight processing"""
+                        use_gemm_woq_plugin=True, use_fp8_qdq=False, clamp_val=None):
+    """
+    Linear weight processing with support for various quantization methods.
+    
+    Args:
+        weight: Weight tensor
+        prefix: Weight name prefix
+        bias: Optional bias tensor
+        use_weight_only: Enable weight-only quantization
+        plugin_weight_only_quant_type: Quantization type for weight-only
+        dtype: Target dtype for non-quantized weights
+        use_gemm_woq_plugin: Use GEMM weight-only quantization plugin
+        use_fp8_qdq: Enable FP8 QDQ quantization (FP8)
+        clamp_val: Clamping values for FP8 quantization
+    """
     results = {}
     
-    if use_weight_only:
+    if use_fp8_qdq:
+        # FP8 QDQ per-channel quantization
+        if clamp_val is None:
+            raise ValueError(f"clamp_val is required for FP8 quantization: {prefix}")
+        
+        processed_weight, weight_scales = fp8_per_channel_quant_weight_gpu(weight, clamp_val)
+        results[prefix + 'weight'] = processed_weight
+        results[prefix + 'per_channel_scale'] = weight_scales
+        logger.debug(f"Applied FP8 quantization to {prefix}")
+        
+    elif use_weight_only:
         # Weight-only quantization
         if weight.dim() > 2:
             v = weight.transpose(1, 2).contiguous()
@@ -59,8 +99,8 @@ def simple_linear_weight(weight, prefix, bias=None, use_weight_only=False,
             results[prefix + 'weight'] = processed_torch_weights
         results[prefix + 'per_channel_scale'] = torch_weight_scales
     else:
-        # Simple case: just store the weight
-        results[prefix + 'weight'] = weight
+        # Standard precision: just store the weight
+        results[prefix + 'weight'] = weight.to(dtype)
     
     if bias is not None:
         results[prefix + 'bias'] = bias
@@ -156,13 +196,36 @@ def convert_and_save(
     plugin_weight_only_quant_type = torch.int8 if use_weight_only else None
     use_gemm_woq_plugin = True  # Enable for quantization support
     
+    # Initialize quantization variables
+    use_fp8_qdq = quant_algo == QuantAlgo.FP8
+    use_mxfp4_fp8 = quant_algo == QuantAlgo.W4A8_MXFP4_FP8
+    clamp_val = getattr(config.quantization, 'clamp_val', None) if use_fp8_qdq else None
+    
     # Determine target precision based on quantization setting
     target_dtype = str_dtype_to_torch(config.dtype)
     
-    # MXFP4 dequantization target: FP8 if FP8 quantization, otherwise dtype
-    if quant_algo == QuantAlgo.FP8:
-        mxfp4_dequant_dtype = torch.float8_e4m3fn  # MXFP4 → FP8
-        logger.info(f"FP8 quantization: MXFP4 → FP8, Regular → {target_dtype}")
+    # MXFP4 dequantization target based on quantization mode
+    if use_fp8_qdq:
+        mxfp4_dequant_dtype = target_dtype  # MXFP4 → BF16 → FP8
+        logger.info(f"FP8_QDQ quantization: MXFP4 → BF16 → FP8, Regular → BF16 → FP8")
+        
+        # Initialize FP8 scaling factor dtype for FP8_QDQ mode
+        fake_fp8_sf_dt = torch.float32
+        
+        # FP8 scaling factor generation functions for FP8_QDQ mode
+        def get_fp8_activation_scaling_factor() -> torch.Tensor:
+            # Activation scaling factors are always (1,) shape regardless of MoE
+            return torch.tensor([1.0], dtype=fake_fp8_sf_dt)
+            
+        def get_fp8_weights_scaling_factor(num_experts: int = 1) -> torch.Tensor:
+            # Weight scaling factors: (num_experts, 1) for MoE, (1,) for non-MoE
+            if num_experts > 1:
+                return torch.ones([num_experts, 1], dtype=fake_fp8_sf_dt)
+            else:
+                return torch.tensor([1.0], dtype=fake_fp8_sf_dt)
+    elif use_mxfp4_fp8:
+        mxfp4_dequant_dtype = None  # Keep MXFP4 native format
+        logger.info(f"W4A8_MXFP4_FP8 quantization: MoE → native MXFP4, Regular → {target_dtype}")
         
         # Initialize FP8 scaling factor dtype (following Gemma pattern)
         fake_fp8_sf_dt = torch.float32
@@ -408,7 +471,7 @@ def convert_and_save(
                         simple_linear_weight(qkv_w_all, f'transformer.layers.{i}.attention.qkv.',
                                              qkv_b_all, use_weight_only,
                                              plugin_weight_only_quant_type, target_dtype,
-                                             use_gemm_woq_plugin, 
+                                             use_gemm_woq_plugin, use_fp8_qdq, clamp_val
                                              ))  # Simple weight storage
                 else:
                     # GQA-aware TP split: split Q per num_heads, duplicate KV per num_kv_heads
@@ -444,7 +507,7 @@ def convert_and_save(
                         simple_linear_weight(qkv_w_tp, f'transformer.layers.{i}.attention.qkv.',
                                              qkv_b_tp, use_weight_only,
                                              plugin_weight_only_quant_type, target_dtype,
-                                             use_gemm_woq_plugin,
+                                             use_gemm_woq_plugin, use_fp8_qdq, clamp_val
                                              ))  # Simple weight storage
 
                 o_w = get(f'model.layers.{i}.self_attn.o_proj.weight').to(target_dtype)
@@ -456,7 +519,7 @@ def convert_and_save(
                         simple_linear_weight(o_w, f'transformer.layers.{i}.attention.dense.',
                                              o_b, use_weight_only,
                                              plugin_weight_only_quant_type, target_dtype,
-                                             use_gemm_woq_plugin,
+                                             use_gemm_woq_plugin, use_fp8_qdq, clamp_val
                                              ))  # Simple weight storage
                 else:
                     # dense is row-parallel in many models; split columns for output gathering
@@ -466,7 +529,7 @@ def convert_and_save(
                         simple_linear_weight(tp_w, f'transformer.layers.{i}.attention.dense.',
                                              o_b, use_weight_only,
                                              plugin_weight_only_quant_type, target_dtype,
-                                             use_gemm_woq_plugin,
+                                             use_gemm_woq_plugin, use_fp8_qdq, clamp_val
                                              ))  # Simple weight storage
 
                 in_ln = get(f'model.layers.{i}.input_layernorm.weight').to(target_dtype)
@@ -536,15 +599,20 @@ def convert_and_save(
                         logger.debug(f"Layer {i} fc: Native MXFP4 blocks {fc_blocks.shape}, scales {fc_scales.shape}")
                     else:
                         # Tensor Parallel support for native MXFP4
-                        # fc (gate_up_proj) is ColLinear-like: split along OUT dimension  
-                        # Note: fc_blocks/fc_scales now in segregated format [g0,g1,...,u0,u1,...] for SwiGLU
+                        # MoE FC: ColLinear-style intermediate dimension splitting
+                        # All experts preserved, but intermediate dimension split across ranks
                         assert fc_blocks.dim() in [3, 4], f"fc_blocks unexpected dim: {fc_blocks.shape}"
                         assert fc_scales.dim() == 3, f"fc_scales expected 3D [E, OUT, IN/vec], got: {fc_scales.shape}"
                         
-                        out_axis_blocks_tp = -3 if fc_blocks.dim() == 4 else -2
-                        fc_blocks_tp = torch.chunk(fc_blocks, tp_size, dim=out_axis_blocks_tp)[rank].contiguous()
-                        fc_scales_tp = torch.chunk(fc_scales, tp_size, dim=-2)[rank].contiguous()  # Split OUT dimension
-                        fc_bias_tp = torch.chunk(fc_bias, tp_size, dim=-1)[rank].contiguous()
+                        # ColLinear: Split intermediate (OUT) dimension for MoE FC layers
+                        # MXFP4 blocks: [E, OUT, IN, pack] or [E, OUT, IN] 
+                        # Split along OUT dimension (SwiGLU: 2*intermediate_size)
+                        assert fc_blocks.shape[1] % tp_size == 0, f"fc_blocks OUT dim {fc_blocks.shape[1]} not divisible by tp_size {tp_size}"
+                        
+                        out_dim_idx = 1  # Always dimension 1 for OUT in [E, OUT, IN, pack]
+                        fc_blocks_tp = torch.chunk(fc_blocks, tp_size, dim=out_dim_idx)[rank].contiguous()
+                        fc_scales_tp = torch.chunk(fc_scales, tp_size, dim=1)[rank].contiguous()  # Split OUT dimension  
+                        fc_bias_tp = torch.chunk(fc_bias, tp_size, dim=1)[rank].contiguous()    # Split OUT dimension
                         
                         fc_blocks_ckpt = _collapse_pack_dim(fc_blocks_tp)
                         weights[f'transformer.layers.{i}.mlp.fc.weight'] = fc_blocks_ckpt.contiguous()
@@ -555,19 +623,42 @@ def convert_and_save(
                 else:
                     # Simple dequantization based on quantization setting
                     if tp_size == 1:
-                        fc_weight = _dequantize_mxfp4(fc_blocks, fc_scales, dtype=mxfp4_dequant_dtype)
-                        weights[f'transformer.layers.{i}.mlp.fc.weight'] = fc_weight.contiguous()
-                        weights[f'transformer.layers.{i}.mlp.fc.bias'] = fc_bias
+                        if use_fp8_qdq:
+                            # For FP8: MXFP4 → BF16 → FP8 + per_channel_scale
+                            fc_weight = _dequantize_mxfp4(fc_blocks, fc_scales, dtype=target_dtype)
+                            fc_results = simple_linear_weight(fc_weight, f'transformer.layers.{i}.mlp.fc.',
+                                                               fc_bias, use_weight_only=False,
+                                                               plugin_weight_only_quant_type=plugin_weight_only_quant_type,
+                                                               dtype=target_dtype, use_gemm_woq_plugin=use_gemm_woq_plugin,
+                                                               use_fp8_qdq=use_fp8_qdq, clamp_val=clamp_val)
+                            weights.update(fc_results)
+                        else:
+                            # Standard: MXFP4 → target dtype
+                            fc_weight = _dequantize_mxfp4(fc_blocks, fc_scales, dtype=mxfp4_dequant_dtype)
+                            weights[f'transformer.layers.{i}.mlp.fc.weight'] = fc_weight.contiguous()
+                            weights[f'transformer.layers.{i}.mlp.fc.bias'] = fc_bias
                     else:
-                        # TP chunking for dequantized path
-                        out_axis_blocks_tp = -3 if fc_blocks.dim() == 4 else -2
-                        fc_blocks_tp = torch.chunk(fc_blocks, tp_size, dim=out_axis_blocks_tp)[rank].contiguous()
-                        fc_scales_tp = torch.chunk(fc_scales, tp_size, dim=-2)[rank].contiguous()
-                        fc_bias_tp = torch.chunk(fc_bias, tp_size, dim=-1)[rank].contiguous()
+                        # ColLinear: TP chunking for dequantized path - intermediate (OUT) dimension splitting
+                        assert fc_blocks.shape[1] % tp_size == 0, f"fc_blocks OUT dim {fc_blocks.shape[1]} not divisible by tp_size {tp_size}"
+                        
+                        fc_blocks_tp = torch.chunk(fc_blocks, tp_size, dim=1)[rank].contiguous()  # Split OUT dimension
+                        fc_scales_tp = torch.chunk(fc_scales, tp_size, dim=1)[rank].contiguous()  # Split OUT dimension
+                        fc_bias_tp = torch.chunk(fc_bias, tp_size, dim=1)[rank].contiguous()     # Split OUT dimension
 
-                        fc_weight_tp = _dequantize_mxfp4(fc_blocks_tp, fc_scales_tp, dtype=mxfp4_dequant_dtype)
-                        weights[f'transformer.layers.{i}.mlp.fc.weight'] = fc_weight_tp.contiguous()
-                        weights[f'transformer.layers.{i}.mlp.fc.bias'] = fc_bias_tp
+                        if use_fp8_qdq:
+                            # For FP8: MXFP4 → BF16 → FP8 + per_channel_scale
+                            fc_weight_tp = _dequantize_mxfp4(fc_blocks_tp, fc_scales_tp, dtype=target_dtype)
+                            fc_results_tp = simple_linear_weight(fc_weight_tp, f'transformer.layers.{i}.mlp.fc.',
+                                                                 fc_bias_tp, use_weight_only=False,
+                                                                 plugin_weight_only_quant_type=plugin_weight_only_quant_type,
+                                                                 dtype=target_dtype, use_gemm_woq_plugin=use_gemm_woq_plugin,
+                                                                 use_fp8_qdq=use_fp8_qdq, clamp_val=clamp_val)
+                            weights.update(fc_results_tp)
+                        else:
+                            # Standard: MXFP4 → target dtype
+                            fc_weight_tp = _dequantize_mxfp4(fc_blocks_tp, fc_scales_tp, dtype=mxfp4_dequant_dtype)
+                            weights[f'transformer.layers.{i}.mlp.fc.weight'] = fc_weight_tp.contiguous()
+                            weights[f'transformer.layers.{i}.mlp.fc.bias'] = fc_bias_tp
 
                 down_blocks = get(f'model.layers.{i}.mlp.experts.down_proj_blocks')
                 down_scales = get(f'model.layers.{i}.mlp.experts.down_proj_scales')
@@ -602,13 +693,18 @@ def convert_and_save(
                         logger.debug(f"Layer {i} proj: Native MXFP4 blocks {proj_blocks.shape}, scales {proj_scales.shape}")
                     else:
                         # Tensor Parallel support for native MXFP4
-                        # proj is RowLinear-like: split along IN dimension
+                        # MoE Proj: RowLinear-style input dimension splitting
                         assert proj_blocks.dim() in [3, 4], f"proj_blocks unexpected dim: {proj_blocks.shape}"
                         assert proj_scales.dim() == 3, f"proj_scales expected 3D [E, OUT, IN/vec], got: {proj_scales.shape}"
                         
-                        in_axis_blocks_tp = -2 if proj_blocks.dim() == 4 else -1
-                        proj_blocks_tp = torch.chunk(proj_blocks, tp_size, dim=in_axis_blocks_tp)[rank].contiguous()
-                        proj_scales_tp = torch.chunk(proj_scales, tp_size, dim=-1)[rank].contiguous()  # Split IN dimension
+                        # RowLinear: Split input (IN) dimension for MoE Proj layers
+                        # MXFP4 blocks: [E, OUT, IN, pack] or [E, OUT, IN]
+                        # Split along IN dimension (from FC output)
+                        assert proj_blocks.shape[2] % tp_size == 0, f"proj_blocks IN dim {proj_blocks.shape[2]} not divisible by tp_size {tp_size}"
+                        
+                        in_dim_idx = 2  # Always dimension 2 for IN in [E, OUT, IN, pack] 
+                        proj_blocks_tp = torch.chunk(proj_blocks, tp_size, dim=in_dim_idx)[rank].contiguous()
+                        proj_scales_tp = torch.chunk(proj_scales, tp_size, dim=2)[rank].contiguous()  # Split IN dimension
 
                         proj_blocks_ckpt = _collapse_pack_dim(proj_blocks_tp)
                         weights[f'transformer.layers.{i}.mlp.proj.weight'] = proj_blocks_ckpt.contiguous()
@@ -617,25 +713,46 @@ def convert_and_save(
                         
                 else:
                     # Simple dequantization based on quantization setting
-                    proj_weight = _dequantize_mxfp4(proj_blocks, proj_scales, dtype=mxfp4_dequant_dtype)
+                    proj_weight = _dequantize_mxfp4(proj_blocks, proj_scales, dtype=target_dtype if use_fp8_qdq else mxfp4_dequant_dtype)
                     assert proj_weight.shape[-1] == config.intermediate_size, \
                         f"PROJ in_features {proj_weight.shape[-1]} != intermediate_size {config.intermediate_size}"
                     
                     if tp_size == 1:
-                        weights[f'transformer.layers.{i}.mlp.proj.weight'] = proj_weight.contiguous()
-                        weights[f'transformer.layers.{i}.mlp.proj.bias'] = down_bias.to(target_dtype).contiguous()
+                        if use_fp8_qdq:
+                            # For FP8: MXFP4 → BF16 → FP8 + per_channel_scale
+                            proj_results = simple_linear_weight(proj_weight, f'transformer.layers.{i}.mlp.proj.',
+                                                                down_bias.to(target_dtype), use_weight_only=False,
+                                                                plugin_weight_only_quant_type=plugin_weight_only_quant_type,
+                                                                dtype=target_dtype, use_gemm_woq_plugin=use_gemm_woq_plugin,
+                                                                use_fp8_qdq=use_fp8_qdq, clamp_val=clamp_val)
+                            weights.update(proj_results)
+                        else:
+                            # Standard: MXFP4 → target dtype
+                            weights[f'transformer.layers.{i}.mlp.proj.weight'] = proj_weight.contiguous()
+                            weights[f'transformer.layers.{i}.mlp.proj.bias'] = down_bias.to(target_dtype).contiguous()
                     else:
-                        # Split along IN axis for RowLinear-like proj
-                        proj_weight_tp = torch.chunk(proj_weight, tp_size, dim=-1)[rank].contiguous()
-                        weights[f'transformer.layers.{i}.mlp.proj.weight'] = proj_weight_tp
-                        weights[f'transformer.layers.{i}.mlp.proj.bias'] = down_bias.to(target_dtype).contiguous()
+                        # RowLinear: Split along IN axis (dimension 2) for proj dequantized path
+                        assert proj_weight.shape[2] % tp_size == 0, f"proj_weight IN dim {proj_weight.shape[2]} not divisible by tp_size {tp_size}"
+                        proj_weight_tp = torch.chunk(proj_weight, tp_size, dim=2)[rank].contiguous()
+                        if use_fp8_qdq:
+                            # For FP8: MXFP4 → BF16 → FP8 + per_channel_scale
+                            proj_results_tp = simple_linear_weight(proj_weight_tp, f'transformer.layers.{i}.mlp.proj.',
+                                                                   down_bias.to(target_dtype), use_weight_only=False,
+                                                                   plugin_weight_only_quant_type=plugin_weight_only_quant_type,
+                                                                   dtype=target_dtype, use_gemm_woq_plugin=use_gemm_woq_plugin,
+                                                                   use_fp8_qdq=use_fp8_qdq, clamp_val=clamp_val)
+                            weights.update(proj_results_tp)
+                        else:
+                            # Standard: MXFP4 → target dtype
+                            weights[f'transformer.layers.{i}.mlp.proj.weight'] = proj_weight_tp
+                            weights[f'transformer.layers.{i}.mlp.proj.bias'] = down_bias.to(target_dtype).contiguous()
 
                 # BF16 per-expert path intentionally not supported for gpt-oss (MoE uses MXFP4)
                 
-                # Generate FP8 scaling factors (corrected based on TensorRT-LLM standard)
-                if quant_algo == QuantAlgo.FP8:
-                    tllm_prex = f'transformer.layers.{i}'
-                    
+                tllm_prex = f'transformer.layers.{i}'
+                
+                # Generate FP8 scaling factors for weights (when FP8 quantization is enabled)
+                if use_fp8_qdq:
                     # Get MoE experts count (following Grok pattern)
                     num_experts = config.moe.num_experts if config.moe and config.moe.num_experts > 0 else 1
                     
@@ -650,55 +767,40 @@ def convert_and_save(
                     weights[f'{tllm_prex}.mlp.fc.weights_scaling_factor'] = get_fp8_weights_scaling_factor(num_experts=num_experts)
                     weights[f'{tllm_prex}.mlp.proj.activation_scaling_factor'] = get_fp8_activation_scaling_factor()
                     weights[f'{tllm_prex}.mlp.proj.weights_scaling_factor'] = get_fp8_weights_scaling_factor(num_experts=num_experts)
-                    
+                
+                # Generate KV cache scaling factors (when KV cache quantization is enabled)
+                kv_cache_quant_algo = getattr(config.quantization, 'kv_cache_quant_algo', None)
+                if kv_cache_quant_algo == QuantAlgo.FP8:
                     # KV cache scaling factors (following Gemma pattern exactly)
                     scaling_factor = 1.0
                     weights[f'{tllm_prex}.attention.kv_cache_scaling_factor'] = torch.tensor(
-                        [scaling_factor], dtype=fake_fp8_sf_dt)
+                        [scaling_factor], dtype=torch.float32)
                     # Generate reciprocal scaling factor (following modeling_utils.py pattern)
                     weights[f'{tllm_prex}.attention.kv_cache_rcp_scaling_factor'] = torch.reciprocal(
-                        torch.tensor([scaling_factor], dtype=fake_fp8_sf_dt))
+                        torch.tensor([scaling_factor], dtype=torch.float32))
 
         # Embeddings & final norm & lm_head (once per rank)
+        # Note: Keep embeddings in full precision to avoid FP8 arithmetic issues
         emb_w = get('model.embed_tokens.weight').to(target_dtype)
         if tp_size == 1:
-            # Use simple_linear_weight for proper quantization (copied from Qwen3)
-            weights.update(
-                simple_linear_weight(emb_w, 'transformer.vocab_embedding.',
-                                     None, use_weight_only,
-                                     plugin_weight_only_quant_type, target_dtype,
-                                     use_gemm_woq_plugin,
-                                     ))  # Simple weight storage
+            # Store embedding weights without FP8 quantization
+            weights['transformer.vocab_embedding.weight'] = emb_w.contiguous()
         else:
             # column-sharded along vocab dimension
             tp_emb = torch.chunk(emb_w, tp_size, dim=0)[rank].contiguous()
-            weights.update(
-                simple_linear_weight(tp_emb, 'transformer.vocab_embedding.',
-                                     None, use_weight_only,
-                                     plugin_weight_only_quant_type, target_dtype,
-                                     use_gemm_woq_plugin,
-                                     ))  # Simple weight storage
+            weights['transformer.vocab_embedding.weight'] = tp_emb.contiguous()
 
         ln_f = get('model.norm.weight').to(target_dtype)
         weights['transformer.ln_f.weight'] = ln_f.contiguous()
 
+        # Note: Keep lm_head in full precision to avoid FP8 arithmetic issues with share_embedding
         lm_w = get('lm_head.weight').to(target_dtype)
         if tp_size == 1:
-            # Use simple_linear_weight for proper quantization (copied from Qwen3)
-            weights.update(
-                simple_linear_weight(lm_w, 'lm_head.',
-                                     None, use_weight_only,
-                                     plugin_weight_only_quant_type, target_dtype,
-                                     use_gemm_woq_plugin,
-                                     ))  # Simple weight storage
+            # Store lm_head weights without FP8 quantization
+            weights['lm_head.weight'] = lm_w.contiguous()
         else:
             tp_lm = torch.chunk(lm_w, tp_size, dim=0)[rank].contiguous()
-            weights.update(
-                simple_linear_weight(tp_lm, 'lm_head.',
-                                     None, use_weight_only,
-                                     plugin_weight_only_quant_type, target_dtype,
-                                     use_gemm_woq_plugin,
-                                     ))  # Simple weight storage
+            weights['lm_head.weight'] = tp_lm.contiguous()
 
     # Router weight (optional; present in MoE) — write on all ranks
     if weight_map is not None:
