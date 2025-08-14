@@ -39,7 +39,6 @@ class GptOssConfig(PretrainedConfig):
         assert isinstance(moe, MoeConfig)
         self.moe = moe.validate()
 
-        # Always use float32 for logits to ensure TensorRT-LLM runtime compatibility
         if 'logits_dtype' not in kwargs:
             kwargs['logits_dtype'] = 'float32'
         super().__init__(hidden_act=hidden_act, **kwargs)
@@ -69,13 +68,10 @@ class GptOssConfig(PretrainedConfig):
         attention_bias = getattr(hf, "attention_bias", True)
         initial_context_length = getattr(hf, "initial_context_length", None)
 
-        # Build
         moe_cfg = None
         if num_experts is not None and num_experts > 0:
             moe_cfg = MoeConfig(num_experts=num_experts, top_k=experts_per_token).validate()
 
-        # Hidden activation: TRT-LLM gating expects a gated activation name (e.g., 'swiglu').
-        # GPT-OSS MoE uses gate_up fusion semantics, so enforce 'swiglu' when MoE is present.
         hidden_act = getattr(hf, "hidden_act", "silu")
         if moe_cfg is not None and moe_cfg.num_experts > 0:
             hidden_act = "swiglu"

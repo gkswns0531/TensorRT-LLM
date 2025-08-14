@@ -245,8 +245,7 @@ def convert_and_save(
         mxfp4_dequant_dtype = target_dtype  # MXFP4 → BF16/FP16
         logger.info(f"Standard precision: {target_dtype}")
 
-    # Force RoPE type that TRT plugin recognizes
-    config.position_embedding_type = "rope_gpt_neox"
+    # Keep position embedding type from HF config (e.g., Yarn) for consistency across backends
     # Save initial config.json (may be overwritten after dimension inference)
     config.to_json_file(str(output / 'config.json'))
 
@@ -569,15 +568,15 @@ def convert_and_save(
                 gate_w, up_w = _deinterleave_gate_up(gate_up_blocks, out_axis_blocks)
                 gate_sc, up_sc = _deinterleave_gate_up(gate_up_scales, out_axis_scales)
 
-                # Create segregated format: [up0,up1,...,gate0,gate1,...] for SwiGLU (following other models)
-                # TensorRT-LLM SwiGLU: x, gate = chunk(weight, 2) → x * silu(gate)
-                fc_blocks = torch.concat([up_w, gate_w], dim=out_axis_blocks).contiguous()
-                fc_scales = torch.concat([up_sc, gate_sc], dim=out_axis_scales).contiguous()
+                # Create segregated format: [gate0,gate1,...,up0,up1,...] for SwiGLU
+                # TensorRT-LLM SwiGLU expects [gate, up] ordering
+                fc_blocks = torch.concat([gate_w, up_w], dim=out_axis_blocks).contiguous()
+                fc_scales = torch.concat([gate_sc, up_sc], dim=out_axis_scales).contiguous()
                 
-                # Deinterleave bias: [g0,u0,g1,u1,...] → [u0,u1,...,g0,g1,...] (UP first, GATE second)
-                gate_b = gate_up_bias[:, ::2]  # [g0, g1, g2, ...]  
+                # Deinterleave bias: [g0,u0,g1,u1,...] → [g0,g1,...,u0,u1,...] (GATE first, UP second)
+                gate_b = gate_up_bias[:, ::2]  # [g0, g1, g2, ...]
                 up_b = gate_up_bias[:, 1::2]   # [u0, u1, u2, ...]
-                fc_bias = torch.concat([up_b, gate_b], dim=-1).contiguous()  # [u0,u1,...,g0,g1,...] (UP, GATE)
+                fc_bias = torch.concat([gate_b, up_b], dim=-1).contiguous()
                 # Cast bias to unified target precision
                 fc_bias = fc_bias.to(target_dtype)
 

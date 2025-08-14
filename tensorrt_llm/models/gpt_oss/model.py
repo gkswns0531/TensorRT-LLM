@@ -39,7 +39,7 @@ class _GptOssDecoderLayer(Module):
         pos_type = config.position_embedding_type
         if isinstance(pos_type, str):
             if pos_type.lower() == 'yarn':
-                pos_type = PositionEmbeddingType.rope_gpt_neox
+                pos_type = PositionEmbeddingType.yarn
         # Propagate normalized position embedding type back to config for plugin const params
         self.config.position_embedding_type = pos_type
 
