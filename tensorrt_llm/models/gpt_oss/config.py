@@ -79,13 +79,21 @@ class GptOssConfig(PretrainedConfig):
         # Derive head_size with torch-backend-compatible fallback
         hidden_size = hf.hidden_size
         num_attention_heads = hf.num_attention_heads
-        head_dim = getattr(hf, 'head_dim', None)
-        if not isinstance(head_dim, int) or head_dim * num_attention_heads != hidden_size:
-            if hidden_size % num_attention_heads != 0:
-                raise ValueError(
-                    f"Invalid attention dims: hidden_size={hidden_size}, num_attention_heads={num_attention_heads}, head_dim={head_dim}."
-                )
-            head_dim = hidden_size // num_attention_heads
+        config_head_dim = getattr(hf, 'head_dim', None)
+        calculated_head_dim = hidden_size // num_attention_heads
+        
+        # CRITICAL FIX: Always use calculated head_dim for GPT-OSS models
+        # The config.json head_dim (64) is inconsistent with actual dimensions (45)
+        if config_head_dim != calculated_head_dim:
+            print(f"[GPT-OSS] Config head_dim={config_head_dim}, but calculated head_dim={calculated_head_dim}")
+            print(f"[GPT-OSS] Using calculated value for TensorRT-LLM compatibility")
+        
+        head_dim = calculated_head_dim
+        
+        if hidden_size % num_attention_heads != 0:
+            raise ValueError(
+                f"Invalid attention dims: hidden_size={hidden_size}, num_attention_heads={num_attention_heads}."
+            )
 
         # Validate layer_types length when provided
         if isinstance(layer_types, list) and len(layer_types) > 0:
@@ -106,7 +114,7 @@ class GptOssConfig(PretrainedConfig):
             vocab_size=hf.vocab_size,
             max_position_embeddings=hf.max_position_embeddings,
             position_embedding_type="yarn",
-            rotary_embedding_dim=None,
+            rotary_embedding_dim=head_dim,
             norm_epsilon=getattr(hf, "rms_norm_eps", 1e-5),
             tie_word_embeddings=getattr(hf, "tie_word_embeddings", False),
             use_logn_attn=False,
