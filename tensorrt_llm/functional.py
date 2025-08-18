@@ -5806,7 +5806,13 @@ def gpt_attention(
         spec_decoding_max_generation_length, is_mla_enabled, q_lora_rank,
         kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim, v_head_dim,
         fuse_fp4_quant_pf, skip_attn_pf, cp_size, cp_rank, cp_group,
-        use_logn_scaling
+        use_logn_scaling,
+        # Enable attention sinks only when provided (default disabled)
+        trt.PluginField(
+            "use_attention_sinks",
+            np.array(np.int8(attention_sinks is not None), dtype=np.int8),
+            trt.PluginFieldType.INT8,
+        ),
     ])
 
     attn_plug = attn_plg_creator.create_plugin("causal_attn", pfc)
@@ -5818,17 +5824,16 @@ def gpt_attention(
     if attention_packed_mask is not None:
         # usePackedCustomMask
         plug_inputs += [attention_packed_mask]
-    # Build attention_sinks tensor: use provided or default to zeros [num_heads]
-    attn_sinks_e = attention_sinks
-    if attn_sinks_e is None:
-        attn_sinks_e = constant(np.zeros((num_heads,), dtype=np.float32))
     if use_cache:
         plug_inputs += [
             sequence_length,
             host_past_key_value_lengths,
             host_max_attention_window_sizes,
             host_sink_token_length,
-            attn_sinks_e,
+        ]
+        if attention_sinks is not None:
+            plug_inputs += [attention_sinks]
+        plug_inputs += [
             context_lengths,
             cache_indirection,
             host_request_types,
@@ -5837,7 +5842,10 @@ def gpt_attention(
         plug_inputs += [
             host_max_attention_window_sizes,
             host_sink_token_length,
-            attn_sinks_e,
+        ]
+        if attention_sinks is not None:
+            plug_inputs += [attention_sinks]
+        plug_inputs += [
             context_lengths,
             host_request_types,
         ]

@@ -64,6 +64,7 @@ public:
     GPTAttentionPluginCommon(void const* data, size_t length);
 
     ~GPTAttentionPluginCommon() override = default;
+    void setUseAttentionSinks(bool const use_attention_sinks) { mUseAttentionSinks = use_attention_sinks; }
 
     template <typename T>
     int enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
@@ -92,6 +93,8 @@ protected:
 
 private:
     std::shared_ptr<tensorrt_llm::kernels::DecoderXQARunnerResource> mResource;
+protected:
+    bool mUseAttentionSinks{false};
 };
 
 class GPTAttentionPluginCreatorCommon : public BaseCreator

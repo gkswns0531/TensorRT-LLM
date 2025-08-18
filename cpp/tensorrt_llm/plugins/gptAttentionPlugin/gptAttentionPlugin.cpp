@@ -161,7 +161,7 @@ bool GPTAttentionPlugin::isEntryUsed(IdxEntry const& entry) const
     case IdxEntry::HOST_PAST_KEY_VALUE_LENGTHS: return useKVCache();
     case IdxEntry::HOST_MAX_ATTENTION_WINDOW: return true;
     case IdxEntry::HOST_SINK_TOKEN_LENGTH: return true;
-    case IdxEntry::ATTENTION_SINKS: return true;
+    case IdxEntry::ATTENTION_SINKS: return mUseAttentionSinks;
     case IdxEntry::CONTEXT_LENGTHS: return true;
     case IdxEntry::CACHE_INDIR: return useKVCache();
     case IdxEntry::REQUEST_TYPES: return true;
@@ -345,7 +345,7 @@ bool GPTAttentionPlugin::supportsFormatCombination(
     {
         return inOut[pos].type == nvinfer1::DataType::kINT32;
     }
-    else if (pos == getIdx(IdxEntry::ATTENTION_SINKS))
+    else if (mUseAttentionSinks && (pos == getIdx(IdxEntry::ATTENTION_SINKS)))
     {
         posCaseLine = __LINE__;
         result = inOut[pos].type == nvinfer1::DataType::kFLOAT && inOut[pos].format == TensorFormat::kLINEAR;
@@ -1375,6 +1375,11 @@ IPluginV2* GPTAttentionPluginCreator::createPlugin(char const* name, PluginField
             static_cast<int32_t>(p.getScalar<int32_t>("cp_size").value()),
             static_cast<int32_t>(p.getScalar<int32_t>("cp_rank").value()),
             static_cast<std::set<int32_t>>(p.getSet<int32_t>("cp_group").value()));
+        
+        if (auto flag = p.getScalar<int8_t>("use_attention_sinks"); flag.has_value())
+        {
+            obj->setUseAttentionSinks(static_cast<bool>(flag.value()));
+        }
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;
     }

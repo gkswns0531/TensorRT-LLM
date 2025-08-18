@@ -102,6 +102,7 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(int layer_idx, int num_heads,
     mCpGroup = std::move(cp_group);
     mFuseFp4Quant = fuse_fp4_quant;
     mSkipAttn = skip_attn;
+    mUseAttentionSinks = false;
 }
 
 // Parameterized constructor
@@ -166,6 +167,7 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(void const* data, size_t leng
     read(d, mSkipAttn);
     read(d, mCpSize);
     read(d, mCpRank);
+    read(d, mUseAttentionSinks);
 
     mKVCacheQuantMode = tc::QuantMode(kvCacheQuantMode);
 
@@ -218,7 +220,8 @@ size_t GPTAttentionPluginCommon::getCommonSerializationSize() const noexcept
         + sizeof(mSpecDecodingIsGenerationLengthVariable) + sizeof(mSpecDecodingMaxGenerationLength)
         + sizeof(mNbMultiBlockSemaphores) + sizeof(mIsMLAEnabled) + sizeof(mMLAParams) + sizeof(mFuseFp4Quant)
         + sizeof(mSkipAttn) + sizeof(uint32_t) // size of DecoderXQARunnerResource buffer.
-        + sizeof(mCpSize) + sizeof(mCpRank) + sizeof(int32_t) * mCpGroup.size() + mResource->getSerializationSize();
+        + sizeof(mCpSize) + sizeof(mCpRank) + sizeof(int32_t) * mCpGroup.size() + mResource->getSerializationSize()
+        + sizeof(mUseAttentionSinks);
 }
 
 void GPTAttentionPluginCommon::serializeCommon(void* buffer) const noexcept
@@ -279,6 +282,7 @@ void GPTAttentionPluginCommon::serializeCommon(void* buffer) const noexcept
     write(d, mSkipAttn);
     write(d, mCpSize);
     write(d, mCpRank);
+    write(d, mUseAttentionSinks);
 
     // An uint32_t that specifies the size of the serialized buffer, followed by the actual content.
     uint32_t decoderXQARunnerResourceSerializedSize = mResource->getSerializationSize();
@@ -366,6 +370,7 @@ GPTAttentionPluginCreatorCommon::GPTAttentionPluginCreatorCommon()
     mPluginAttributes.emplace_back(PluginField("cp_size", nullptr, PluginFieldType::kINT32));
     mPluginAttributes.emplace_back(PluginField("cp_rank", nullptr, PluginFieldType::kINT32));
     mPluginAttributes.emplace_back(PluginField("cp_group", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("use_attention_sinks", nullptr, PluginFieldType::kINT8));
     mFC.nbFields = mPluginAttributes.size();
     mFC.fields = mPluginAttributes.data();
 }
