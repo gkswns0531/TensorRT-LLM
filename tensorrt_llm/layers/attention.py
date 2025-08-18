@@ -801,6 +801,7 @@ class Attention(Module):
         cross_kv_reuse: Optional[Tensor] = None,
         all_reduce_params: Optional[AllReduceParams] = None,
         skip_attn=None,
+        attention_sinks=None,
     ):
         attention_input = hidden_states
 
@@ -810,6 +811,12 @@ class Attention(Module):
         ) if spec_decoding_params is None else spec_decoding_params
 
         mrope_params = MropeParams() if mrope_params is None else mrope_params
+
+        # Inject attention_sinks into attention_params to propagate to gpt_attention
+        if attention_sinks is not None:
+            if attention_params is None:
+                attention_params = AttentionParams()
+            attention_params.attention_sinks = attention_sinks
         logn_scaling = None
         if self.use_logn_scaling:
             logn_scaling = self.logn_scaling.value
