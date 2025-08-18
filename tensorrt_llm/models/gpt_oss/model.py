@@ -162,7 +162,8 @@ class _GptOssDecoderLayer(Module):
                            lora_layer_params=lora_layer_params)
         if attention_params is not None:
             attn_kwargs['attention_params'] = attention_params
-        attn_result = self.attention(hidden_states, **attn_kwargs)
+        # Pass attention_sinks explicitly to align with torch backend behavior
+        attn_result = self.attention(hidden_states, attention_sinks=sinks_arg, **attn_kwargs)
         attn_out = attn_result[0] if isinstance(attn_result, tuple) else attn_result
 
         # Align dtype before residual add

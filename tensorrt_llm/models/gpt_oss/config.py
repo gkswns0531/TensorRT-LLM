@@ -95,12 +95,22 @@ class GptOssConfig(PretrainedConfig):
                 f"Invalid attention dims: hidden_size={hidden_size}, num_attention_heads={num_attention_heads}."
             )
 
-        # Validate layer_types length when provided
+        # Validate or synthesize layer_types for sliding-window convention
         if isinstance(layer_types, list) and len(layer_types) > 0:
             if len(layer_types) != hf.num_hidden_layers:
                 raise ValueError(
                     f"layer_types length {len(layer_types)} must equal num_hidden_layers {hf.num_hidden_layers}"
                 )
+        else:
+            # If HF config doesn't provide layer_types but sliding_window is set,
+            # materialize the torch convention at config level: apply sliding to even-indexed layers
+            sw = getattr(hf, "sliding_window", None)
+            if sw is not None:
+                synthesized = [
+                    ("sliding_attention" if (i % 2 == 0) else "attention")
+                    for i in range(hf.num_hidden_layers)
+                ]
+                layer_types = synthesized
 
         return cls(
             architecture=getattr(hf, "architectures", [""])[0],
