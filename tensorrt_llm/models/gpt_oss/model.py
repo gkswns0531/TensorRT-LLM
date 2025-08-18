@@ -27,17 +27,7 @@ class _GptOssDecoderLayer(Module):
                                        eps=config.norm_epsilon,
                                        dtype=dtype)
 
-        # sliding window control via layer_types if provided
-        sliding_window_length = None
-        if config.layer_types and layer_idx < len(config.layer_types):
-            layer_type = config.layer_types[layer_idx]
-            if layer_type == 'sliding_attention' and getattr(config, 'sliding_window', None):
-                sliding_window_length = config.sliding_window
-                print(f"[GPT-OSS] Layer {layer_idx}: sliding_attention with window={sliding_window_length}")
-            elif layer_type == 'full_attention':
-                print(f"[GPT-OSS] Layer {layer_idx}: full_attention")
-            else:
-                print(f"[GPT-OSS] Layer {layer_idx}: unknown attention type '{layer_type}'")
+        # sliding window policy is applied at runtime via kv_cache_params.host_max_attention_window_sizes
 
         # Normalize position embedding type for compatibility with plugin expectations
         pos_type = config.position_embedding_type
@@ -47,7 +37,7 @@ class _GptOssDecoderLayer(Module):
         # Propagate normalized position embedding type back to config for plugin const params
         self.config.position_embedding_type = pos_type
 
-        # Configure attention with sliding window support
+        # Configure attention
         attention_kwargs = {
             'local_layer_idx': layer_idx,
             'hidden_size': config.hidden_size,
@@ -61,26 +51,13 @@ class _GptOssDecoderLayer(Module):
             'position_embedding_type': pos_type,
             'rotary_embedding_base': config.rope_theta,
             'rotary_embedding_scaling': config.rope_scaling,
-            'rotary_embedding_dim': config.rotary_embedding_dim,
             'tp_rank': config.mapping.tp_rank,
             'tp_group': config.mapping.tp_group,
             'tp_size': config.mapping.tp_size,
             'quant_mode': config.quant_mode,
             'layernorm_type': LayerNormType.RmsNorm,
         }
-        
-        # Add sliding window support if available
-        if sliding_window_length is not None:
-            # TensorRT-LLM may use different parameter names for sliding window
-            # Try multiple possible parameter names
-            try:
-                attention_kwargs['sliding_window'] = sliding_window_length
-            except:
-                try:
-                    attention_kwargs['max_window_size'] = sliding_window_length
-                except:
-                    attention_kwargs['window_size'] = sliding_window_length
-        
+
         self.attention = Attention(**attention_kwargs)
         # register sinks parameter under attention for weight loading compatibility
         setattr(self.attention, 'sinks', Parameter(shape=(config.num_attention_heads // max(1, config.mapping.tp_size), ),
