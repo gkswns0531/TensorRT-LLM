@@ -1067,6 +1067,7 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
         if (isEntryUsed(IdxEntry::ATTENTION_SINKS))
         {
             attention_sinks_ptr = reinterpret_cast<float const*>(inputs[getIdx(IdxEntry::ATTENTION_SINKS)]);
+            enqueue_params.attention_sinks = attention_sinks_ptr;
         }
 
         enqueueContext<T, KVCacheBuffer>(enqueue_params, stream);
@@ -1141,6 +1142,13 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
         {
             // mUseSpecDecoding is changed, need to re-prepare the DecoderXQARunner
             prepareEnqueueGeneration<T, KVCacheBuffer>(enqueue_params);
+        }
+
+        // attention sinks (device) if provided
+        if (isEntryUsed(IdxEntry::ATTENTION_SINKS))
+        {
+            attention_sinks_ptr = reinterpret_cast<float const*>(inputs[getIdx(IdxEntry::ATTENTION_SINKS)]);
+            enqueue_params.attention_sinks = attention_sinks_ptr;
         }
 
         enqueueGeneration<T, KVCacheBuffer>(enqueue_params, stream);
