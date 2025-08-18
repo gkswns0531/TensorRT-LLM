@@ -104,6 +104,7 @@ std::string GPTAttentionPlugin::toString(IdxEntry const& entry) const
         TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING(HOST_PAST_KEY_VALUE_LENGTHS);
         TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING(HOST_MAX_ATTENTION_WINDOW);
         TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING(HOST_SINK_TOKEN_LENGTH);
+        TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING(ATTENTION_SINKS);
         TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING(CONTEXT_LENGTHS);
         TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING(CACHE_INDIR);
         TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING(REQUEST_TYPES);
@@ -160,6 +161,7 @@ bool GPTAttentionPlugin::isEntryUsed(IdxEntry const& entry) const
     case IdxEntry::HOST_PAST_KEY_VALUE_LENGTHS: return useKVCache();
     case IdxEntry::HOST_MAX_ATTENTION_WINDOW: return true;
     case IdxEntry::HOST_SINK_TOKEN_LENGTH: return true;
+    case IdxEntry::ATTENTION_SINKS: return true;
     case IdxEntry::CONTEXT_LENGTHS: return true;
     case IdxEntry::CACHE_INDIR: return useKVCache();
     case IdxEntry::REQUEST_TYPES: return true;
@@ -342,6 +344,11 @@ bool GPTAttentionPlugin::supportsFormatCombination(
     else if (isMRoPE() && (pos == getIdx(IdxEntry::MROPE_POSITION_DELTAS)))
     {
         return inOut[pos].type == nvinfer1::DataType::kINT32;
+    }
+    else if (pos == getIdx(IdxEntry::ATTENTION_SINKS))
+    {
+        posCaseLine = __LINE__;
+        result = inOut[pos].type == nvinfer1::DataType::kFLOAT && inOut[pos].format == TensorFormat::kLINEAR;
     }
     else if (pos == getIdx(IdxEntry::HOST_RUNTIME_PERF_KNOBS) || pos == getIdx(IdxEntry::HOST_CONTEXT_PROGRESS))
     {
@@ -728,6 +735,8 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
     // Rotary inv_freq, cos_sin cache to avoid re-computing.
     float const* rotary_inv_freq = nullptr;
     float2 const* rotary_cos_sin = nullptr;
+    // Optional per-head attention sinks pointer
+    float const* attention_sinks_ptr = nullptr;
 
     bool const useLongRoPECache = isLongRoPE() && max_context_q_len > mRotaryEmbeddingOriginalMaxPositions;
     if (isRoPE())
@@ -787,7 +796,7 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
     int max_encoder_context_len = isCrossAttention() ? inputDesc[getIdx(IdxEntry::CROSS_KV_LENGTH)].dims.d[0] : 0;
     // for enc-dec model, since decoder_input_ids could be longer than 1,
     // such model has an encoder context (for cross attn) and an decoder context (for self attn)
-    // clarify 3 lens:
+    // clarify 3 lenses:
     // -- max_context_q_len: len of decoder input. No "max" concept, it's what it is given.
     //                     Also called (decoder_)input_seq_length, normally 1 for encoder-decoder start token
     // -- max_seq_len: max allowed len of decoder output, i.e. final results
@@ -1052,6 +1061,12 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
             enqueue_params.cross_kv = static_cast<T const*>(inputs[getIdx(IdxEntry::CROSS_KV)]);
             enqueue_params.cross_kv_length = max_encoder_context_len;
             enqueue_params.num_encoder_tokens = num_encoder_tokens;
+        }
+
+        // attention sinks (device) if provided
+        if (isEntryUsed(IdxEntry::ATTENTION_SINKS))
+        {
+            attention_sinks_ptr = reinterpret_cast<float const*>(inputs[getIdx(IdxEntry::ATTENTION_SINKS)]);
         }
 
         enqueueContext<T, KVCacheBuffer>(enqueue_params, stream);

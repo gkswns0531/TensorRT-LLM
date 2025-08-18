@@ -155,7 +155,8 @@ class AttentionParams(object):
                  encoder_input_lengths: Tensor = None,
                  encoder_max_input_length: Tensor = None,
                  host_runtime_perf_knobs: Tensor = None,
-                 host_context_progress: Tensor = None):
+                 host_context_progress: Tensor = None,
+                 attention_sinks: Tensor = None):
         self.sequence_length = sequence_length
         self.context_lengths = context_lengths
         self.host_context_lengths = host_context_lengths
@@ -170,6 +171,7 @@ class AttentionParams(object):
         self.host_runtime_perf_knobs = host_runtime_perf_knobs
 
         self.host_context_progress = host_context_progress
+        self.attention_sinks = attention_sinks
 
         # const parameters that will be reused by all layers.
         self.embed_positions = None
@@ -1129,6 +1131,7 @@ class Attention(Module):
                 host_max_attention_window_sizes=kv_cache_params.
                 host_max_attention_window_sizes,
                 host_sink_token_length=kv_cache_params.host_sink_token_length,
+                attention_sinks=getattr(attention_params, 'attention_sinks', None),
                 context_lengths=attention_params.context_lengths,
                 cache_indirection=kv_cache_params.cache_indirection,
                 host_request_types=attention_params.host_request_types,

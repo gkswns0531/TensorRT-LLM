@@ -494,7 +494,6 @@ class Tensor(object):
         Returns the rank (i.e. the number of dimensions) of the tensor.
         '''
         return len(self.trt_tensor.shape)
-
     def ndim(self):
         '''
         Returns the rank (i.e. the number of dimensions) of the tensor.
@@ -793,8 +792,6 @@ def int_clip(input: Tensor, lower: int, upper: int) -> Tensor:
     res = minimum(input, upper)
     res = maximum(res, lower)
     return res
-
-
 def clip(input: Tensor, alpha: float, beta: float) -> Tensor:
     '''
     Add a CLIP operation that sets the range to [alpha, beta].
@@ -961,8 +958,6 @@ def flip(input: Tensor, dims: Sequence[int]) -> Tensor:
                                        stride=stride_values)
 
     return _create_tensor(layer.get_output(0), layer)
-
-
 def interpolate(input: Tensor,
                 size: Union[int, List[int]] = None,
                 scale_factor: Union[float, List[float]] = None,
@@ -1431,8 +1426,6 @@ def rand(shape: Tensor,
     layer.set_input(1, low.trt_tensor)
     layer.set_input(2, high.trt_tensor)
     return _create_tensor(layer.get_output(0), layer)
-
-
 def categorical_sample(probs: Tensor, rand_data: Tensor = None) -> Tensor:
     '''
     This is a sampling operation and an equivalent of torch.distributions.Categorical.sample()
@@ -1567,8 +1560,6 @@ def arange(start: Union[Tensor, int], end: Union[Tensor, int],
     if tensor.dtype != res_dtype:
         tensor = tensor.cast(dtype)
     return tensor
-
-
 def expand(input: Tensor, expand_shape: Tensor) -> Tensor:
     '''
     Add an operation to expand a tensor.
@@ -1650,7 +1641,7 @@ def einsum(einsum_eq: str, inputs: Sequence[Tensor]) -> Tensor:
     expression will be part of the output in increasing alphabetical order. In
     explicit mode, the output can be controlled by specifying output subscript
     labels by adding an arrow (‘->’) followed by subscripts for the output. For
-    example, “ij,jk->ik” is equivalent to “ij,jk”. Ellipsis (‘…’) can be used
+    example, "ij,jk->ik" is equivalent to "ij,jk". Ellipsis (‘…’) can be used
     in place of subscripts to broadcast the dimensions. See the TensorRT
     Developer Guide for more details on equation syntax.
 
@@ -1925,8 +1916,6 @@ def squeeze(input: Tensor,
     new_shape = concat(new_shape) if len(new_shape) > 0 else []
     input = input.view(new_shape, zero_is_placeholder=zero_is_placeholder)
     return input
-
-
 def unsqueeze(input: Tensor, axis: int):
     '''
     Add an operation to insert a singleton dimension to a tensor.
@@ -2347,8 +2336,6 @@ def nonzero(input: Tensor) -> Tensor:
     '''
     non_zero_layer = default_trtnet().add_non_zero(input.trt_tensor)
     return _create_tensor(non_zero_layer.get_output(0), non_zero_layer)
-
-
 def masked_select(input: Tensor, mask: Tensor) -> Tensor:
     '''
     Add an operation to select elements from a tensor according to a boolean
@@ -2359,7 +2346,7 @@ def masked_select(input: Tensor, mask: Tensor) -> Tensor:
     a new tensor. The output tensor is a 1-D tensor.
 
     The input tensor must have rank >= 1. The shapes of the input tensor and
-    the mask tensor don’t need to match, but they must be able to be broadcasted.
+    the mask tensor don't need to match, but they must be able to be broadcasted.
 
     For example, on input=[[4, 2, 5], [2, 1, 2], [4, 7, 1]], which has a shape
     [3, 3],
@@ -2406,8 +2393,6 @@ def masked_select(input: Tensor, mask: Tensor) -> Tensor:
                                                   shuffle_layer.get_output(0),
                                                   mode=trt.GatherMode.ND)
     return _create_tensor(gather_layer.get_output(0), gather_layer)
-
-
 def cumsum(input: Tensor, dim: int, prefer_plugin: bool = True) -> Tensor:
     '''
     Add an operation to calculate inclusive cumulative sum of elements of
@@ -2879,8 +2864,6 @@ def constant_to_tensor_(input: Union[Tensor, int, float, bool],
         return constant(array_fn_dict[dtype]([input] if to_array else input))
 
     return input
-
-
 def constants_to_tensors_(
         *inputs: Union[Tensor, int, float]) -> Tuple[Tensor, ...]:
     '''
@@ -3127,8 +3110,6 @@ def unary(input: Tensor, op: trt.UnaryOperation) -> Tensor:
     '''
     layer = default_trtnet().add_unary(input.trt_tensor, op)
     return _create_tensor(layer.get_output(0), layer)
-
-
 round = partial(unary, op=trt.UnaryOperation.ROUND)
 sqrt = partial(unary, op=trt.UnaryOperation.SQRT)
 exp = partial(unary, op=trt.UnaryOperation.EXP)
@@ -3381,8 +3362,6 @@ def geglu(x: Tensor) -> Tensor:
     '''
     a, b = chunk(x, 2, dim=-1)
     return a * gelu(b)
-
-
 def quick_gelu(x: Tensor) -> Tensor:
     return x * sigmoid(1.702 * x)
 
@@ -3481,7 +3460,7 @@ def softplus(input: Tensor, beta: float, threshold: float) -> Tensor:
         The output tensor created by that layer.
     '''
     sf_layer = default_trtnet().add_activation(input.trt_tensor,
-                                               trt.ActivationType.SOFTPLUS)
+                                                trt.ActivationType.SOFTPLUS)
     sf_layer.alpha = 1 / beta
     sf_layer.beta = beta
 
@@ -3871,8 +3850,6 @@ def unbind(input: Tensor, dim: int = 0):
     outputs = split(input, 1, dim)
     output_shape = [input.shape[i] for i in range(ndim) if i != dim]
     return [output.view(output_shape) for output in outputs]
-
-
 class AllReduceStrategy(IntEnum):
     NCCL = 0
     MIN_LATENCY = 1
@@ -3895,8 +3872,6 @@ class AllReduceFusionOp(IntEnum):
     RESIDUAL_RMS_NORM_OUT_QUANT_FP8 = 6
     RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4 = 7
     MOE_FINALIZE_ALLREDUCE_RESIDUAL_RMS_NORM = 8
-
-
 class AllReduceParams():
 
     def __init__(self,
@@ -4334,8 +4309,6 @@ def recv(tensor: Tensor, src: int) -> Tensor:
     layer = default_trtnet().add_plugin_v2(plug_inputs, recv_plug)
     _add_plugin_info(layer, recv_plg_creator, "recv", pfc)
     return _create_tensor(layer.get_output(0), layer).cast(tensor.dtype)
-
-
 def gemm_allreduce(a: Tensor,
                    b: Tensor,
                    group: List[int],
@@ -4672,8 +4645,6 @@ def bert_attention(tensor: Tensor,
     output = _create_tensor(layer.get_output(0), layer)
     assert output is not None
     return output
-
-
 class RopeEmbeddingUtils:
 
     @staticmethod
@@ -5143,13 +5114,12 @@ class RopeEmbeddingUtils:
             qkv = qkv.view(input_shape)
 
         return qkv
-
     @staticmethod
     def apply_rotary_pos_emb_cogvlm(qkv, position_embedding,
-                                    num_attention_heads, attention_head_size,
-                                    max_position_embeddings,
-                                    rotary_embedding_scale,
-                                    remove_input_padding) -> Tensor:
+                                     num_attention_heads, attention_head_size,
+                                     max_position_embeddings,
+                                     rotary_embedding_scale,
+                                     remove_input_padding) -> Tensor:
         input = qkv[0] if isinstance(qkv, list) else qkv
         input_shape = shape(input)
         batch_size = 1 if remove_input_padding else shape(input, 0)
@@ -5229,6 +5199,7 @@ def gpt_attention(
     host_past_key_value_lengths: Optional[Tensor],
     host_max_attention_window_sizes: Tensor,
     host_sink_token_length: Tensor,
+    attention_sinks: Optional[Tensor] = None,
     context_lengths: Optional[Tensor],
     cache_indirection: Optional[Tensor],
     host_request_types: Tensor,
@@ -5847,12 +5818,17 @@ def gpt_attention(
     if attention_packed_mask is not None:
         # usePackedCustomMask
         plug_inputs += [attention_packed_mask]
+    # Build attention_sinks tensor: use provided or default to zeros [num_heads]
+    attn_sinks_e = attention_sinks
+    if attn_sinks_e is None:
+        attn_sinks_e = constant(np.zeros((num_heads,), dtype=np.float32))
     if use_cache:
         plug_inputs += [
             sequence_length,
             host_past_key_value_lengths,
             host_max_attention_window_sizes,
             host_sink_token_length,
+            attn_sinks_e,
             context_lengths,
             cache_indirection,
             host_request_types,
@@ -5861,6 +5837,7 @@ def gpt_attention(
         plug_inputs += [
             host_max_attention_window_sizes,
             host_sink_token_length,
+            attn_sinks_e,
             context_lengths,
             host_request_types,
         ]
@@ -6058,8 +6035,6 @@ def layer_norm(input: Tensor,
                                                bias.trt_tensor, axes_mask)
     layer.epsilon = eps
     return _create_tensor(layer.get_output(0), layer)
-
-
 def rms_norm(input: Tensor,
              normalized_shape: Union[int, Tuple[int]],
              num_groups: int = 1,
@@ -6129,8 +6104,6 @@ def rms_norm(input: Tensor,
         y = y * weight
 
     return y
-
-
 def rearrange(inputs: Union[Tensor, Sequence[Tensor]], expression: str,
               **kwargs) -> Tensor:
     '''
@@ -6611,8 +6584,6 @@ def is_gated_activation(activation):
     '''
     assert activation in ACT2FN
     return activation in GATED_ACT_2_ACT
-
-
 def non_gated_version(activation):
     '''
     Given an activation function, get the non-gated version.
@@ -6822,8 +6793,6 @@ def dora_plugin(activations: Tensor,
     _add_plugin_info(layer, dora_plg_creator, "dora", pfc)
     output = _create_tensor(layer.get_output(0), layer).cast(activations.dtype)
     return output
-
-
 def mamba_conv1d(input: Tensor,
                  conv_state_or_ptr: Tensor,
                  conv_weight: Tensor,
@@ -6943,8 +6912,6 @@ def mamba_conv1d(input: Tensor,
     else:
         present_state = _create_tensor(layer.get_output(1), layer)
         return output, present_state
-
-
 def selective_scan(input: Tensor,
                    state_or_ptr: Tensor,
                    delta: Tensor,
@@ -7425,8 +7392,6 @@ def scatter_nd(input: Tensor, mask: Tensor, source: Tensor) -> Tensor:
                                                  source.trt_tensor,
                                                  mode=trt.ScatterMode.ND)
     return _create_tensor(scatter_layer.get_output(0), scatter_layer)
-
-
 def low_latency_gemm(input: Tensor,
                      mat2: Tensor,
                      alpha: Optional[np.ndarray] = None,
