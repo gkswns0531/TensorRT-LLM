@@ -19,8 +19,8 @@ from pydantic import PrivateAttr, field_validator, model_validator
 from strenum import StrEnum
 from transformers import PreTrainedTokenizerBase
 
-from tensorrt_llm.lora_manager import (LoraConfig,
-                                       get_default_trtllm_modules_to_hf_modules)
+from tensorrt_llm.lora_helper import (LoraConfig,
+                                      get_default_trtllm_modules_to_hf_modules)
 
 from .._utils import mpi_rank
 from ..auto_parallel import AutoParallelConfig, infer_cluster_config
@@ -182,6 +182,12 @@ class MoeConfig(StrictBaseModel):
         default=None,
         description="Configuration for MoE load balancing.",
         json_schema_extra={"type": "Union[MoeLoadBalancerConfig, str]"})
+
+    disable_finalize_fusion: bool = Field(
+        default=False,
+        description=
+        "Disable FC2+finalize kernel fusion in CUTLASS MoE backend. Setting this to True recovers deterministic numerical behavior with top-k > 2."
+    )
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -990,6 +996,14 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     dtype: str = Field(default="auto",
                        description="The data type to use for the KV cache.")
 
+    # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
+    mamba_ssm_cache_dtype: Literal[
+        "auto", "float16", "bfloat16", "float32"] = Field(
+            default="auto",
+            description=
+            "The data type to use for the Mamba SSM cache. If set to 'auto', the data type will be inferred from the model config."
+        )
+
     def _to_pybind(self):
         return _KvCacheConfig(
             enable_block_reuse=self.enable_block_reuse,
@@ -1047,7 +1061,7 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
     Configuration for the cache transceiver.
     """
 
-    backend: Optional[Literal["default", "ucx", "nixl", "mpi"]] = Field(
+    backend: Optional[Literal["DEFAULT", "UCX", "NIXL", "MPI"]] = Field(
         default=None,
         description=
         "The communication backend type to use for the cache transceiver.")
@@ -1310,6 +1324,10 @@ class BaseLlmArgs(StrictBaseModel):
         validate_default=True,
         status="deprecated",
     )
+
+    return_perf_metrics: bool = Field(default=False,
+                                      description="Return perf metrics.",
+                                      status="prototype")
 
     _parallel_config: Optional[object] = PrivateAttr(default=None)
     _model_format: Optional[_ModelFormatKind] = PrivateAttr(default=None)
@@ -1950,6 +1968,13 @@ class LoadFormat(Enum):
     DUMMY = 1
 
 
+class SamplerType(StrEnum):
+    """Enum for sampler type options."""
+    TRTLLMSampler = "TRTLLMSampler"
+    TorchSampler = "TorchSampler"
+    auto = "auto"
+
+
 class TorchCompileConfig(StrictBaseModel):
     """
     Configuration for torch.compile.
@@ -1964,6 +1989,21 @@ class TorchCompileConfig(StrictBaseModel):
     enable_piecewise_cuda_graph: bool = Field(
         default=False,
         description="Enable piecewise CUDA graph in torch.compile.")
+
+    capture_num_tokens: Optional[List[int]] = Field(
+        default=None,
+        description=
+        "List of num of tokens to capture the piecewise CUDA graph for. If not provided, the number of tokens will be the same as cuda_graph_config.batch_sizes."
+    )
+
+    @field_validator('capture_num_tokens')
+    @classmethod
+    def validate_capture_num_tokens(cls, v):
+        if v is None:
+            return v
+        if any(t <= 0 for t in v):
+            raise ValueError("capture_num_tokens must contain positive ints.")
+        return sorted(set(v), reverse=True)
 
     enable_userbuffers: bool = Field(
         default=True,
@@ -2037,11 +2077,11 @@ class TorchLlmArgs(BaseLlmArgs):
         "If true, will iterate over sampling_params of each request and use the corresponding sampling strategy, e.g. top-k, top-p, etc.",
         status="beta")
 
-    use_torch_sampler: bool = Field(
-        default=False,
+    sampler_type: Union[str, SamplerType] = Field(
+        default=SamplerType.auto,
         description=
-        "If true, will use the Torch sampler instead of the TRTLLM sampler.",
-        status="beta")
+        "The type of sampler to use. Options are TRTLLMSampler, TorchSampler or auto. Defaults to auto, which will use TorchSampler unless BeamSearch is requested.",
+        status="prototype")
 
     enable_iter_perf_stats: bool = Field(
         default=False,
@@ -2057,6 +2097,12 @@ class TorchLlmArgs(BaseLlmArgs):
     print_iter_log: bool = Field(default=False,
                                  description="Print iteration logs.",
                                  status="beta")
+
+    batch_wait_timeout_ms: float = Field(
+        default=0,
+        description=
+        "If greater than 0, the request queue might wait up to batch_wait_timeout_ms to receive max_batch_size requests, if fewer than max_batch_size requests are currently available. If 0, no waiting occurs.",
+        status="prototype")
 
     torch_compile_config: Optional[TorchCompileConfig] = Field(
         default=None, description="Torch compile config.", status="prototype")
@@ -2304,6 +2350,13 @@ class TorchLlmArgs(BaseLlmArgs):
                 )
         return self
 
+    @model_validator(mode='after')
+    def validate_batch_wait_timeout_ms(self) -> 'TorchLlmArgs':
+        """Validate batch wait timeout."""
+        if self.batch_wait_timeout_ms < 0:
+            raise ValueError("batch_wait_timeout_ms must be greater than 0")
+        return self
+
     # TODO: Remove this after the PyTorch backend is fully migrated to TorchLlmArgs from ExecutorConfig
     def get_pytorch_backend_config(self) -> "PyTorchConfig":
         from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
@@ -2326,8 +2379,9 @@ class TorchLlmArgs(BaseLlmArgs):
             attn_backend=self.attn_backend,
             moe_backend=self.moe_config.backend,
             enable_mixed_sampler=self.enable_mixed_sampler,
-            use_torch_sampler=self.use_torch_sampler,
+            sampler_type=self.sampler_type,
             kv_cache_dtype=self.kv_cache_config.dtype,
+            mamba_ssm_cache_dtype=self.kv_cache_config.mamba_ssm_cache_dtype,
             enable_iter_perf_stats=self.enable_iter_perf_stats,
             enable_iter_req_stats=self.enable_iter_req_stats,
             print_iter_log=self.print_iter_log,
@@ -2342,6 +2396,10 @@ class TorchLlmArgs(BaseLlmArgs):
             enable_piecewise_cuda_graph
             if self.torch_compile_config is not None else TorchCompileConfig.
             model_fields['enable_piecewise_cuda_graph'].default,
+            torch_compile_piecewise_cuda_graph_num_tokens=self.
+            torch_compile_config.capture_num_tokens
+            if self.torch_compile_config is not None else
+            TorchCompileConfig.model_fields['capture_num_tokens'].default,
             torch_compile_enable_userbuffers=self.torch_compile_config.
             enable_userbuffers if self.torch_compile_config is not None else
             TorchCompileConfig.model_fields['enable_userbuffers'].default,
@@ -2352,6 +2410,7 @@ class TorchLlmArgs(BaseLlmArgs):
             enable_layerwise_nvtx_marker=self.enable_layerwise_nvtx_marker,
             load_format=self.load_format,
             enable_min_latency=self.enable_min_latency,
+            moe_disable_finalize_fusion=self.moe_config.disable_finalize_fusion,
             stream_interval=self.stream_interval,
             force_dynamic_quantization=self.force_dynamic_quantization,
             allreduce_strategy=self.allreduce_strategy,
@@ -2363,7 +2422,8 @@ class TorchLlmArgs(BaseLlmArgs):
             AttentionDpConfig.model_fields['timeout_iters'].default,
             attention_dp_batching_wait_iters=self.attention_dp_config.
             batching_wait_iters if self.attention_dp_config is not None else
-            AttentionDpConfig.model_fields['batching_wait_iters'].default)
+            AttentionDpConfig.model_fields['batching_wait_iters'].default,
+            batch_wait_timeout_ms=self.batch_wait_timeout_ms)
 
 
 def update_llm_args_with_extra_dict(
