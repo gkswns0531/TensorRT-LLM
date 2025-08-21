@@ -10,7 +10,7 @@ from tensorrt_llm.layers import (Attention, AttentionMaskType, ColumnLinear, Emb
 from tensorrt_llm.parameter import Parameter
 from tensorrt_llm.module import Module
 from tensorrt_llm.models.modeling_utils import DecoderLayerList, DecoderModelForCausalLM
-from tensorrt_llm.lora_manager import LoraConfig, use_lora
+from tensorrt_llm.lora_manager import LoraConfig
 from .config import GptOssConfig
 
 
@@ -314,6 +314,7 @@ class GptOssForCausalLM(DecoderModelForCausalLM):
         return plugin_config
 
     def use_lora(self, lora_config: LoraConfig):
+        from tensorrt_llm.lora_manager import use_lora
         use_lora(self, lora_config)
 
     @classmethod
