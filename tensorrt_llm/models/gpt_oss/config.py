@@ -82,13 +82,17 @@ class GptOssConfig(PretrainedConfig):
         config_head_dim = getattr(hf, 'head_dim', None)
         calculated_head_dim = hidden_size // num_attention_heads
         
-        # CRITICAL FIX: Always use calculated head_dim for GPT-OSS models
-        # The config.json head_dim (64) is inconsistent with actual dimensions (45)
-        if config_head_dim != calculated_head_dim:
-            print(f"[GPT-OSS] Config head_dim={config_head_dim}, but calculated head_dim={calculated_head_dim}")
-            print(f"[GPT-OSS] Using calculated value for TensorRT-LLM compatibility")
-        
-        head_dim = calculated_head_dim
+        # Use config head_dim if available, fallback to calculated
+        if config_head_dim is not None:
+            head_dim = config_head_dim
+            print(f"[GPT-OSS] Using config head_dim={head_dim}")
+            # Verify consistency: hidden_size should equal num_attention_heads * head_dim
+            expected_hidden_size = num_attention_heads * head_dim
+            if expected_hidden_size != hidden_size:
+                print(f"[GPT-OSS] WARNING: hidden_size={hidden_size} != num_attention_heads({num_attention_heads}) * head_dim({head_dim}) = {expected_hidden_size}")
+        else:
+            head_dim = calculated_head_dim
+            print(f"[GPT-OSS] Using calculated head_dim={head_dim}")
         
         if hidden_size % num_attention_heads != 0:
             raise ValueError(
