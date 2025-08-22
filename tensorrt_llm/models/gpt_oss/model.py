@@ -32,8 +32,8 @@ class _GptOssDecoderLayer(Module):
         # Normalize position embedding type for compatibility with plugin expectations
         pos_type = config.position_embedding_type
         if isinstance(pos_type, str):
-            if pos_type.lower() == 'yarn':
-                pos_type = PositionEmbeddingType.yarn
+            if pos_type.lower() == 'rope_gpt_neox':
+                pos_type = PositionEmbeddingType.rope_gpt_neox
         # Propagate normalized position embedding type back to config for plugin const params
         self.config.position_embedding_type = pos_type
 
@@ -50,7 +50,6 @@ class _GptOssDecoderLayer(Module):
             'bias': config.attention_bias,
             'position_embedding_type': pos_type,
             'rotary_embedding_base': config.rope_theta,
-            'rotary_embedding_scaling': config.rope_scaling,
             'tp_rank': config.mapping.tp_rank,
             'tp_group': config.mapping.tp_group,
             'tp_size': config.mapping.tp_size,

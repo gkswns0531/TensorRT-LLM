@@ -123,7 +123,7 @@ class GptOssConfig(PretrainedConfig):
             intermediate_size=hf.intermediate_size,
             vocab_size=hf.vocab_size,
             max_position_embeddings=hf.max_position_embeddings,
-            position_embedding_type="yarn",
+            position_embedding_type="rope_gpt_neox",
             rotary_embedding_dim=head_dim,
             norm_epsilon=getattr(hf, "rms_norm_eps", 1e-5),
             tie_word_embeddings=getattr(hf, "tie_word_embeddings", False),
