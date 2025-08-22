@@ -82,17 +82,21 @@ class GptOssConfig(PretrainedConfig):
         config_head_dim = getattr(hf, 'head_dim', None)
         calculated_head_dim = hidden_size // num_attention_heads
         
-        # Use config head_dim if available, fallback to calculated
+        # GPT-OSS uses Group Query Attention (GQA): Q has full heads, K/V have fewer heads
+        # Correct formula: q_proj_dim = num_attention_heads * head_dim ≠ hidden_size
+        # Use config head_dim as it represents the actual head dimension
         if config_head_dim is not None:
             head_dim = config_head_dim
+            # Verify GQA structure: Q proj should be num_heads * head_dim
+            expected_q_dim = num_attention_heads * head_dim
+            expected_kv_dim = hf.num_key_value_heads * head_dim
             print(f"[GPT-OSS] Using config head_dim={head_dim}")
-            # Verify consistency: hidden_size should equal num_attention_heads * head_dim
-            expected_hidden_size = num_attention_heads * head_dim
-            if expected_hidden_size != hidden_size:
-                print(f"[GPT-OSS] WARNING: hidden_size={hidden_size} != num_attention_heads({num_attention_heads}) * head_dim({head_dim}) = {expected_hidden_size}")
+            print(f"[GPT-OSS] GQA structure: Q_dim={expected_q_dim}, KV_dim={expected_kv_dim}, hidden_size={hidden_size}")
         else:
+            # Fallback to calculation if config head_dim is missing
             head_dim = calculated_head_dim
-            print(f"[GPT-OSS] Using calculated head_dim={head_dim}")
+            print(f"[GPT-OSS] No config head_dim found, using calculated head_dim={head_dim}")
+            print(f"[GPT-OSS] WARNING: This may be incorrect for GQA models")
         
         if hidden_size % num_attention_heads != 0:
             raise ValueError(
