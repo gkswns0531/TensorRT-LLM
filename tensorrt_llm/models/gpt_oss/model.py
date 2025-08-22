@@ -129,8 +129,12 @@ class _GptOssDecoderLayer(Module):
         sinks_arg = attention_sinks
         if sinks_arg is None and hasattr(self.attention, 'sinks'):
             sinks_tensor = getattr(self.attention, 'sinks')
-            # Parameter may carry .value or .data depending on backend; forward raw to attention
-            sinks_arg = getattr(sinks_tensor, 'value', None) or getattr(sinks_tensor, 'data', None) or sinks_tensor
+            # Extract tensor from Parameter - never pass Parameter object to avoid .trt_tensor error
+            if hasattr(sinks_tensor, 'value') and sinks_tensor.value is not None:
+                sinks_arg = sinks_tensor.value
+            else:
+                # If Parameter is not initialized or has no value, skip sinks entirely
+                sinks_arg = None
         # Ensure attention_params is not None to avoid downstream attribute access errors
         attn_kwargs = dict(attention_mask=attention_mask,
                            use_cache=use_cache,
@@ -232,7 +236,10 @@ class _GptOssModel(Module):
                 if k in kwargs:
                     layer_kwargs[k] = kwargs[k]
             # Pass attention sinks for GPT-OSS streaming support (loaded from checkpoint)
-            attention_sinks = getattr(layer.attention, 'sinks', None)
+            sinks_param = getattr(layer.attention, 'sinks', None)
+            attention_sinks = None
+            if sinks_param is not None and hasattr(sinks_param, 'value') and sinks_param.value is not None:
+                attention_sinks = sinks_param.value
             hidden_states = layer(hidden_states, attention_sinks=attention_sinks, **layer_kwargs)
             
         # Pipeline parallelism: apply final norm on last pp rank or send to next pp rank
