@@ -213,6 +213,30 @@ void GPTAttentionPlugin::initEntryIdx()
     }
 }
 
+void GPTAttentionPlugin::forceReinitializeEntryIdx()
+{
+    // Phase 1: Force reinitialization with consistency check
+    initEntryIdx();
+    
+    // Self-verification: ensure consistency between flag and indexing
+    bool expected_sinks_usage = mUseAttentionSinks;
+    bool actual_sinks_indexed = isEntryUsed(IdxEntry::ATTENTION_SINKS);
+    
+    if (expected_sinks_usage != actual_sinks_indexed) {
+        TLLM_LOG_ERROR("Index consistency check FAILED: expected_sinks=%s, actual_indexed=%s",
+                      expected_sinks_usage ? "true" : "false",
+                      actual_sinks_indexed ? "true" : "false");
+        
+        // This is a critical error - the plugin state is inconsistent
+        TLLM_CHECK_WITH_INFO(false,
+            common::fmtstr("Plugin state inconsistency detected: mUseAttentionSinks=%s but isEntryUsed(ATTENTION_SINKS)=%s",
+                          expected_sinks_usage ? "true" : "false",
+                          actual_sinks_indexed ? "true" : "false"));
+    } else {
+        TLLM_LOG_DEBUG("Index consistency verified: sinks_usage=%s", expected_sinks_usage ? "true" : "false");
+    }
+}
+
 GPTAttentionPlugin::IndexType GPTAttentionPlugin::getIdx(IdxEntry const& entry) const
 {
     TLLM_CHECK_WITH_INFO(
@@ -223,7 +247,20 @@ GPTAttentionPlugin::IndexType GPTAttentionPlugin::getIdx(IdxEntry const& entry) 
 // IPluginV2DynamicExt Methods
 GPTAttentionPlugin* GPTAttentionPlugin::clone() const noexcept
 {
-    return dynamic_cast<GPTAttentionPlugin*>(this->cloneImpl<GPTAttentionPlugin>());
+    auto* cloned = dynamic_cast<GPTAttentionPlugin*>(this->cloneImpl<GPTAttentionPlugin>());
+    
+    // Phase 1: Ensure state synchronization during cloning
+    if (cloned != nullptr) {
+        cloned->setUseAttentionSinks(this->mUseAttentionSinks);
+        cloned->forceReinitializeEntryIdx();
+        
+        // Debug logging for clone verification
+        TLLM_LOG_DEBUG("Plugin cloned: original_sinks=%s, cloned_sinks=%s",
+                       this->mUseAttentionSinks ? "true" : "false",
+                       cloned->mUseAttentionSinks ? "true" : "false");
+    }
+    
+    return cloned;
 }
 
 static int getPackedTensorHiddenDimIndex(bool removePadding)
@@ -1384,10 +1421,20 @@ IPluginV2* GPTAttentionPluginCreator::createPlugin(char const* name, PluginField
             static_cast<int32_t>(p.getScalar<int32_t>("cp_rank").value()),
             static_cast<std::set<int32_t>>(p.getSet<int32_t>("cp_group").value()));
         
+        // Phase 1: Force synchronization of attention sinks usage
+        bool use_attention_sinks = false;
         if (auto flag = p.getScalar<int8_t>("use_attention_sinks"); flag.has_value())
         {
-            obj->setUseAttentionSinks(static_cast<bool>(flag.value()));
+            use_attention_sinks = static_cast<bool>(flag.value());
+            obj->setUseAttentionSinks(use_attention_sinks);
         }
+        
+        // Force reinitialization of entry indices after setting the flag
+        obj->forceReinitializeEntryIdx();
+        
+        // Debug logging for troubleshooting (can be disabled in production)
+        TLLM_LOG_DEBUG("Plugin created: use_sinks=%s", use_attention_sinks ? "true" : "false");
+        
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;
     }

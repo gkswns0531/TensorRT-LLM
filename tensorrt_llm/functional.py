@@ -5827,6 +5827,10 @@ def gpt_attention(
 
     attn_plug = attn_plg_creator.create_plugin("causal_attn", pfc)
     assert attn_plug
+    
+    # Phase 1: Force consistency between PluginField and plug_inputs
+    use_sinks = attention_sinks is not None
+    
     plug_inputs = [*qkv] if is_unfuse_qkv_gemm else [qkv]
     if attention_mask is not None and mask_type == AttentionMaskType.custom_mask:
         # useFullCustomMask
@@ -5834,31 +5838,42 @@ def gpt_attention(
     if attention_packed_mask is not None and get_sm_version() < 100:
         # usePackedCustomMask
         plug_inputs += [attention_packed_mask]
-    if use_cache:
-        plug_inputs += [
-            sequence_length,
-            host_past_key_value_lengths,
-            host_max_attention_window_sizes,
-            host_sink_token_length,
-        ]
-        if attention_sinks is not None:
-            plug_inputs += [attention_sinks]
-        plug_inputs += [
-            context_lengths,
-            cache_indirection,
-            host_request_types,
-        ]
-    else:
-        plug_inputs += [
-            host_max_attention_window_sizes,
-            host_sink_token_length,
-        ]
-        if attention_sinks is not None:
-            plug_inputs += [attention_sinks]
-        plug_inputs += [
-            context_lengths,
-            host_request_types,
-        ]
+    # Phase 1: Consistent input construction with forced synchronization
+    def validate_and_construct_core_inputs():
+        """Construct core inputs with guaranteed consistency"""
+        core_inputs = []
+        
+        if use_cache:
+            core_inputs += [
+                sequence_length,
+                host_past_key_value_lengths,
+                host_max_attention_window_sizes,
+                host_sink_token_length,
+            ]
+            # Critical: attention_sinks must be at position 5 (after host_sink_token_length)
+            if use_sinks:
+                core_inputs += [attention_sinks]
+            core_inputs += [
+                context_lengths,
+                cache_indirection,
+                host_request_types,
+            ]
+        else:
+            core_inputs += [
+                host_max_attention_window_sizes,
+                host_sink_token_length,
+            ]
+            # Critical: attention_sinks must be at position 2 (after host_sink_token_length) in no-cache mode
+            if use_sinks:
+                core_inputs += [attention_sinks]
+            core_inputs += [
+                context_lengths,
+                host_request_types,
+            ]
+        
+        return core_inputs
+    
+    plug_inputs += validate_and_construct_core_inputs()
     if use_cache:
         if paged_kv_cache_flag:
             assert kv_cache_block_offsets is not None, "Paged kv cache is enabled, the kv_cache_block_offsets tensor shall not be None"
@@ -5942,10 +5957,46 @@ def gpt_attention(
     if logn_scaling is not None:
         plug_inputs += [logn_scaling]
 
-    for idx, i in enumerate(plug_inputs):
-        assert i is not None, f"Found None input for {idx} th item in plugin inputs {plug_inputs}"
+    # Phase 1: Final consistency validation and debug logging
+    def validate_final_inputs():
+        """Final validation of input consistency"""
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        # Calculate expected position of attention_sinks (accounting for optional inputs)
+        base_inputs = 1 if not is_unfuse_qkv_gemm else 3  # qkv tensor(s)
+        if attention_mask is not None and mask_type == AttentionMaskType.custom_mask:
+            base_inputs += 1
+        if attention_packed_mask is not None and get_sm_version() < 100:
+            base_inputs += 1
+        
+        # In use_cache mode: pos = base_inputs + 4 (seq_len, host_past, host_max, host_sink)
+        # In no-cache mode: pos = base_inputs + 2 (host_max, host_sink)
+        expected_sinks_pos = base_inputs + (4 if use_cache else 2)
+        
+        logger.debug(f"GPT Attention: use_sinks={use_sinks}, expected_pos={expected_sinks_pos}, "
+                    f"total_inputs={len(plug_inputs)}, "
+                    f"pos_{expected_sinks_pos}_exists={'YES' if expected_sinks_pos < len(plug_inputs) else 'NO'}")
+        
+        # Verify attention_sinks position if it should exist
+        if use_sinks and expected_sinks_pos < len(plug_inputs):
+            actual_tensor = plug_inputs[expected_sinks_pos]
+            if hasattr(actual_tensor, 'dtype') and hasattr(actual_tensor, 'shape'):
+                logger.debug(f"Position {expected_sinks_pos}: dtype={actual_tensor.dtype}, shape={getattr(actual_tensor, 'shape', 'unknown')}")
+                
+                # Consistency check: attention_sinks should be float32
+                if not (hasattr(actual_tensor, 'dtype') and 'float32' in str(actual_tensor.dtype)):
+                    logger.warning(f"POTENTIAL ISSUE: Expected float32 attention_sinks at pos={expected_sinks_pos}, "
+                                 f"but found dtype={getattr(actual_tensor, 'dtype', 'unknown')}")
+        
+        return plug_inputs
+    
+    validated_inputs = validate_final_inputs()
 
-    plug_inputs = [i.trt_tensor for i in plug_inputs]
+    for idx, i in enumerate(validated_inputs):
+        assert i is not None, f"Found None input for {idx} th item in plugin inputs {validated_inputs}"
+
+    plug_inputs = [i.trt_tensor for i in validated_inputs]
     layer = default_trtnet().add_plugin_v2(plug_inputs, attn_plug)
     _add_plugin_info(layer, attn_plg_creator, "causal_attn", pfc)
     output = _create_tensor(layer.get_output(0), layer)

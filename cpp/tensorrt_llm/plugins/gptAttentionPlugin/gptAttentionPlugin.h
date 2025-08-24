@@ -234,6 +234,7 @@ private:
     std::string toString(IdxEntry const& entry) const;
     bool isEntryUsed(IdxEntry const& entry) const;
     void initEntryIdx();
+    void forceReinitializeEntryIdx(); // Phase 1: Force synchronization method
     IndexType getIdx(IdxEntry const& entry) const;
 
     // Get generation input sequence length (might be larger than 1 in the speculative decoding mode).
