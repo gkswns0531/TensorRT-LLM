@@ -63,7 +63,6 @@ class Exaone4DecoderLayer(Module):
         self.local_layer_idx = layer_idx - layers_range[0]
 
         # Initialize attention layer with Exaone 4.0 specific configurations
-        # Note: sliding_window parameter not supported in current TensorRT-LLM Attention class
         self.attention = Attention(
             local_layer_idx=self.local_layer_idx,
             hidden_size=config.hidden_size,
@@ -80,7 +79,7 @@ class Exaone4DecoderLayer(Module):
             position_embedding_type=PositionEmbeddingType.rope_gpt_neox,
             rotary_embedding_base=config.rotary_base,
             rotary_embedding_scaling=config.rotary_scaling,
-            # TODO: Sliding window will be added in Phase 2.2 with custom plugins
+            is_local=self.is_sliding,
             tp_group=config.mapping.tp_group,
             tp_size=config.mapping.tp_size,
             quant_mode=config.quant_mode,
