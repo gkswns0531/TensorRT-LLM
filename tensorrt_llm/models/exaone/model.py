@@ -62,15 +62,13 @@ class Exaone4DecoderLayer(Module):
         layers_range = config.mapping.pp_layers(config.num_hidden_layers)
         self.local_layer_idx = layer_idx - layers_range[0]
 
-        # Initialize attention layer with Exaone 4.0 specific configurations
         self.attention = Attention(
             local_layer_idx=self.local_layer_idx,
             hidden_size=config.hidden_size,
             num_attention_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
             attention_head_size=config.head_size,
-            # Exaone 4.0 specific: QK LayerNorm (supported!)
-            qk_layernorm=True,
+            qk_layernorm=getattr(config, 'use_qk_layernorm', True),
             layernorm_type=LayerNormType.RmsNorm,
             max_position_embeddings=config.max_position_embeddings,
             dtype=config.dtype,
@@ -78,6 +76,7 @@ class Exaone4DecoderLayer(Module):
             bias=config.attn_bias,
             position_embedding_type=PositionEmbeddingType.rope_gpt_neox,
             rotary_embedding_base=config.rotary_base,
+            rotary_embedding_base_local=getattr(config, 'rope_local_base_freq', None),
             rotary_embedding_scaling=config.rotary_scaling,
             is_local=self.is_sliding,
             tp_group=config.mapping.tp_group,
