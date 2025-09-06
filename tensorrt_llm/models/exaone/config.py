@@ -49,8 +49,6 @@ class Exaone4Config(PretrainedConfig):
         # Post-norm configuration
         use_post_norm: bool = True,
         use_qk_layernorm: bool = True,
-        # RoPE configuration
-        rope_local_base_freq: Optional[float] = None,
         # Missing essential parameters
         hidden_act: str = "silu",
         norm_epsilon: float = 1e-5,
@@ -109,7 +107,6 @@ class Exaone4Config(PretrainedConfig):
         self.yarn_beta_slow = yarn_beta_slow
         self.use_post_norm = use_post_norm
         self.use_qk_layernorm = use_qk_layernorm
-        self.rope_local_base_freq = rope_local_base_freq
         self.hidden_act = hidden_act
         self.norm_epsilon = norm_epsilon
         

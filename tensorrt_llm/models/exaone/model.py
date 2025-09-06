@@ -76,7 +76,6 @@ class Exaone4DecoderLayer(Module):
             bias=config.attn_bias,
             position_embedding_type=PositionEmbeddingType.rope_gpt_neox,
             rotary_embedding_base=config.rotary_base,
-            rotary_embedding_base_local=getattr(config, 'rope_local_base_freq', None),
             rotary_embedding_scaling=config.rotary_scaling,
             is_local=self.is_sliding,
             tp_group=config.mapping.tp_group,
