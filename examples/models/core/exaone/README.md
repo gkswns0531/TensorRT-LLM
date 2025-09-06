@@ -52,7 +52,7 @@ git clone https://huggingface.co/LGAI-EXAONE/EXAONE-Deep-2.4B $HF_MODEL_DIR
 
 ### EXAONE-4.0
 
-Download he HuggingFace checkpoints of EXAONE-4.0 model. Here, we only use the `EXAONE-4.0-32B` model for the example. From EXAONE-4.0 model, we support only on PyTorch flow.
+Download the HuggingFace checkpoints of EXAONE-4.0 model. Here, we only use the `EXAONE-4.0-32B` model for the example. EXAONE-4.0 supports both PyTorch flow and TensorRT flow.
 
 ```bash
 export HF_MODEL_DIR=hf_models/exaone4
@@ -114,9 +114,11 @@ For models with sliding window attention, DynamicCache is less memory-efficient 
 
 ### TRT flow
 
-The next section describe how to convert the weights from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers) format to the TensorRT-LLM format. We will use llama's [convert_checkpoint.py](../llama/convert_checkpoint.py) for EXAONE model and then we build the model with `trtllm-build`.
+The next section describe how to convert the weights from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers) format to the TensorRT-LLM format. EXAONE-3.0 and EXAONE-Deep use llama's [convert_checkpoint.py](../llama/convert_checkpoint.py), while EXAONE-4.0 uses its own specialized [convert_checkpoint.py](convert_checkpoint.py) to handle unique features like Post-norm architecture, QK LayerNorm, and LLLG sliding window pattern.
 
 ### Convert checkpoint and build TensorRT engine(s)
+
+#### EXAONE-3.0 and EXAONE-Deep
 
 ```bash
 # Build a single-GPU float16 engine from HF weights.

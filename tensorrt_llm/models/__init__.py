@@ -31,6 +31,8 @@ from .deepseek_v2.model import DeepseekV2ForCausalLM
 from .dit.model import DiT
 from .eagle.model import EagleForCausalLM
 from .enc_dec.model import DecoderModel, EncoderModel, WhisperEncoder
+from .exaone.model import (Exaone4DecoderLayer, Exaone4ForCausalLM,
+                           Exaone4Model)
 from .falcon.config import FalconConfig
 from .falcon.model import FalconForCausalLM, FalconModel
 from .gemma.config import (GEMMA2_ARCHITECTURE, GEMMA3_ARCHITECTURE,
@@ -214,6 +216,7 @@ MODEL_MAP = {
     'MLLaMAModel': MLLaMAForCausalLM,  # For modelopt
     'MllamaForConditionalGeneration':
     MLLaMAForCausalLM,  # For mllama load by Auto
+    'Exaone4ForCausalLM': Exaone4ForCausalLM,
     'BertForQuestionAnswering': BertForQuestionAnswering,
     'BertForSequenceClassification': BertForSequenceClassification,
     'BertModel': BertModel,
