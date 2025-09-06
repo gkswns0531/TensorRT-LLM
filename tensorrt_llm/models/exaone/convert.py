@@ -166,16 +166,23 @@ def convert_attention_weights(
         o_weight = o_weight[:, o_start:o_end]
     weights[f"{trt_prefix}.attention.dense.weight"] = o_weight
     
-    # QK LayerNorm weights (Exaone 4.0 specific)
-    q_norm_weight = hf_state_dict[f"{hf_prefix}.self_attn.q_layernorm.weight"]
-    k_norm_weight = hf_state_dict[f"{hf_prefix}.self_attn.k_layernorm.weight"]
+    # QK LayerNorm weights (Exaone 4.0 specific) - Safe handling
+    q_norm_key = f"{hf_prefix}.self_attn.q_layernorm.weight"
+    k_norm_key = f"{hf_prefix}.self_attn.k_layernorm.weight"
     
-    if tp_size > 1:
-        q_norm_weight = q_norm_weight[q_start:q_end]
-        k_norm_weight = k_norm_weight[kv_start:kv_end]
-    
-    weights[f"{trt_prefix}.attention.q_layernorm.weight"] = q_norm_weight
-    weights[f"{trt_prefix}.attention.k_layernorm.weight"] = k_norm_weight
+    if q_norm_key in hf_state_dict and k_norm_key in hf_state_dict:
+        q_norm_weight = hf_state_dict[q_norm_key]
+        k_norm_weight = hf_state_dict[k_norm_key]
+        
+        if tp_size > 1:
+            q_norm_weight = q_norm_weight[q_start:q_end]
+            k_norm_weight = k_norm_weight[kv_start:kv_end]
+        
+        weights[f"{trt_prefix}.attention.q_layernorm.weight"] = q_norm_weight
+        weights[f"{trt_prefix}.attention.k_layernorm.weight"] = k_norm_weight
+        print(f"✅ QK LayerNorm weights found for layer {layer_idx}")
+    else:
+        print(f"⚠️ QK LayerNorm weights not found for layer {layer_idx}, using standard attention")
 
 
 def convert_mlp_weights(

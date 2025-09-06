@@ -48,6 +48,10 @@ class Exaone4Config(PretrainedConfig):
         yarn_beta_slow: float = 1.0,
         # Post-norm configuration
         use_post_norm: bool = True,
+        # Missing essential parameters
+        hidden_act: str = "silu",
+        norm_epsilon: float = 1e-5,
+        head_size: Optional[int] = None,
         # Standard parameters
         rotary_base: float = 10000.0,
         rotary_scaling: Optional[dict] = None,
@@ -101,6 +105,14 @@ class Exaone4Config(PretrainedConfig):
         self.yarn_beta_fast = yarn_beta_fast
         self.yarn_beta_slow = yarn_beta_slow
         self.use_post_norm = use_post_norm
+        self.hidden_act = hidden_act
+        self.norm_epsilon = norm_epsilon
+        
+        # Calculate head_size if not provided
+        if head_size is None:
+            self.head_size = self.hidden_size // self.num_attention_heads
+        else:
+            self.head_size = head_size
 
     def is_sliding_layer(self, layer_idx: int) -> bool:
         """
@@ -164,7 +176,9 @@ class Exaone4Config(PretrainedConfig):
         yarn_params = {}
         if hasattr(hf_config, 'rope_scaling') and hf_config.rope_scaling:
             scaling_config = hf_config.rope_scaling
-            if scaling_config.get("type") == "yarn":
+            # Support both 'type' and 'rope_type' fields (HF config uses 'rope_type')
+            rope_type = scaling_config.get("rope_type", scaling_config.get("type", ""))
+            if rope_type in ["yarn", "llama3"]:
                 yarn_params = {
                     "yarn_factor": scaling_config.get("factor", 1.0),
                     "yarn_low_freq_factor": scaling_config.get("low_freq_factor", 1.0),
@@ -185,6 +199,10 @@ class Exaone4Config(PretrainedConfig):
             max_position_embeddings=hf_config.max_position_embeddings,
             # Model type and dtype
             dtype=dtype,
+            # Missing essential fields
+            hidden_act=getattr(hf_config, "hidden_act", "silu"),
+            norm_epsilon=getattr(hf_config, "rms_norm_eps", 1e-5),
+            head_size=getattr(hf_config, "head_dim", None),  # HF uses head_dim
             # Exaone 4.0 specific
             sliding_window=getattr(hf_config, "sliding_window", 4096),
             sliding_window_pattern=getattr(hf_config, "sliding_window_pattern", "LLLG"),
