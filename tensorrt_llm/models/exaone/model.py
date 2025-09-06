@@ -72,7 +72,7 @@ class Exaone4DecoderLayer(Module):
             layernorm_type=LayerNormType.RmsNorm,
             max_position_embeddings=config.max_position_embeddings,
             dtype=config.dtype,
-            attention_mask_type=AttentionMaskType.causal,
+            attention_mask_type=AttentionMaskType.sliding_window_causal if self.is_sliding else AttentionMaskType.causal,
             bias=config.attn_bias,
             position_embedding_type=PositionEmbeddingType.rope_gpt_neox,
             rotary_embedding_base=config.rotary_base,
