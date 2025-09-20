@@ -40,15 +40,6 @@ if TYPE_CHECKING:
 
 
 class Exaone4DecoderLayer(Module):
-    """
-    Exaone 4.0 Decoder Layer with Post-norm architecture and Sliding Window Attention
-    
-    Key differences from standard decoder layers:
-    1. Post-normalization (Attention → Norm → Residual)
-    2. Sliding Window Attention (layer-dependent LLLG pattern)
-    3. QK LayerNormalization support
-    4. YARN RoPE scaling
-    """
 
     def __init__(self, config: Exaone4Config, layer_idx: int):
         super().__init__()
@@ -62,14 +53,16 @@ class Exaone4DecoderLayer(Module):
         layers_range = config.mapping.pp_layers(config.num_hidden_layers)
         self.local_layer_idx = layer_idx - layers_range[0]
 
+        qk_layernorm = config.use_qk_layernorm
+
         self.attention = Attention(
             local_layer_idx=self.local_layer_idx,
             hidden_size=config.hidden_size,
             num_attention_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
             attention_head_size=config.head_size,
-            qk_layernorm=getattr(config, 'use_qk_layernorm', True),
-            layernorm_type=LayerNormType.RmsNorm,
+            qk_layernorm=qk_layernorm,
+            layernorm_type=LayerNormType.RmsNorm if qk_layernorm else LayerNormType.LayerNorm,
             max_position_embeddings=config.max_position_embeddings,
             dtype=config.dtype,
             attention_mask_type=AttentionMaskType.sliding_window_causal if self.is_sliding else AttentionMaskType.causal,
@@ -123,7 +116,7 @@ class Exaone4DecoderLayer(Module):
             )
 
     def forward(self,
-                hidden_states: Tensor,
+                hidden_states,
                 attention_mask=None,
                 use_cache=False,
                 spec_decoding_params=None,
@@ -244,20 +237,18 @@ class Exaone4DecoderLayer(Module):
 
 
 class Exaone4Model(Module):
-    """Exaone 4.0 Model with Post-norm architecture"""
 
     def __init__(self, config: Exaone4Config):
         super().__init__()
         
-        # Vocabulary embedding
+        # Vocabulary embedding  
         self.vocab_embedding = Embedding(
             num_embeddings=config.vocab_size,
             embedding_dim=config.hidden_size,
             dtype=config.dtype,
-            use_parallel_embedding=config.use_parallel_embedding,
-            sharding_dim=config.embedding_sharding_dim,
             tp_group=config.mapping.tp_group,
             tp_size=config.mapping.tp_size,
+            sharding_dim=config.embedding_sharding_dim,
         )
 
         # Decoder layers with Exaone 4.0 specific architecture
@@ -309,7 +300,7 @@ class Exaone4Model(Module):
 
 
 class Exaone4ForCausalLM(DecoderModelForCausalLM):
-    """Exaone 4.0 For Causal Language Modeling"""
+    config_class = Exaone4Config
     
     def __init__(self, config: Exaone4Config):
         transformer = Exaone4Model(config)

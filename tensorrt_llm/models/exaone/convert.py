@@ -24,25 +24,13 @@ from transformers import AutoConfig, AutoModelForCausalLM
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.mapping import Mapping
 from .config import Exaone4Config
-from .model import Exaone4ForCausalLM
 
 
 def load_exaone4_weights_from_hf_model(
     hf_model_dir: Union[str, Path],
     config: Exaone4Config,
-    model: Exaone4ForCausalLM
+    model
 ) -> Dict[str, torch.Tensor]:
-    """
-    Load and convert HuggingFace Exaone 4.0 weights to TensorRT-LLM format.
-    
-    Args:
-        hf_model_dir: Path to HuggingFace model directory
-        config: TensorRT-LLM configuration
-        model: TensorRT-LLM model instance
-        
-    Returns:
-        Dict[str, torch.Tensor]: Converted weights dictionary
-    """
     # Load HuggingFace model
     print(f"Loading HuggingFace Exaone 4.0 model from {hf_model_dir}")
     hf_model = AutoModelForCausalLM.from_pretrained(
@@ -76,9 +64,12 @@ def load_exaone4_weights_from_hf_model(
     print("Converting final layer norm...")
     weights["transformer.ln_f.weight"] = hf_state_dict["model.norm.weight"]
     
-    # Convert LM head
     print("Converting language model head...")
-    weights["lm_head.weight"] = hf_state_dict["lm_head.weight"]
+    if "lm_head.weight" in hf_state_dict:
+        weights["lm_head.weight"] = hf_state_dict["lm_head.weight"]
+    else:
+        weights["lm_head.weight"] = hf_state_dict["model.embed_tokens.weight"]
+        print("Using tied embeddings for lm_head.weight")
     
     print(f"Successfully converted {len(weights)} weight tensors")
     return weights
@@ -103,7 +94,7 @@ def convert_decoder_layer_weights(
     trt_prefix = f"transformer.layers.{layer_idx}"
     
     # === Attention Weights ===
-    convert_attention_weights(hf_state_dict, weights, hf_prefix, trt_prefix, config)
+    convert_attention_weights(hf_state_dict, weights, hf_prefix, trt_prefix, config, layer_idx)
     
     # === MLP Weights ===
     convert_mlp_weights(hf_state_dict, weights, hf_prefix, trt_prefix, config)
@@ -114,12 +105,12 @@ def convert_decoder_layer_weights(
 
 def convert_attention_weights(
     hf_state_dict: Dict[str, torch.Tensor],
-    weights: Dict[str, torch.Tensor], 
+    weights: Dict[str, torch.Tensor],
     hf_prefix: str,
     trt_prefix: str,
-    config: Exaone4Config
+    config: Exaone4Config,
+    layer_idx: int
 ):
-    """Convert attention weights including QKV projections and QK LayerNorm."""
     
     # Get original weight tensors
     q_weight = hf_state_dict[f"{hf_prefix}.self_attn.q_proj.weight"]
@@ -167,8 +158,8 @@ def convert_attention_weights(
     weights[f"{trt_prefix}.attention.dense.weight"] = o_weight
     
     # QK LayerNorm weights (Exaone 4.0 specific) - Safe handling
-    q_norm_key = f"{hf_prefix}.self_attn.q_layernorm.weight"
-    k_norm_key = f"{hf_prefix}.self_attn.k_layernorm.weight"
+    q_norm_key = f"{hf_prefix}.self_attn.q_norm.weight"
+    k_norm_key = f"{hf_prefix}.self_attn.k_norm.weight"
     
     if q_norm_key in hf_state_dict and k_norm_key in hf_state_dict:
         q_norm_weight = hf_state_dict[q_norm_key]
@@ -180,9 +171,9 @@ def convert_attention_weights(
         
         weights[f"{trt_prefix}.attention.q_layernorm.weight"] = q_norm_weight
         weights[f"{trt_prefix}.attention.k_layernorm.weight"] = k_norm_weight
-        print(f"✅ QK LayerNorm weights found for layer {layer_idx}")
+        pass
     else:
-        print(f"⚠️ QK LayerNorm weights not found for layer {layer_idx}, using standard attention")
+        pass
 
 
 def convert_mlp_weights(
@@ -211,8 +202,9 @@ def convert_mlp_weights(
         gate_weight = gate_weight[start_idx:end_idx, :]
         up_weight = up_weight[start_idx:end_idx, :]
     
-    # Combine gate and up projections for GatedMLP
-    weights[f"{trt_prefix}.mlp.fc.weight"] = torch.cat([gate_weight, up_weight], dim=0)
+    # GatedMLP: fc contains up_weight only, gate is separate
+    weights[f"{trt_prefix}.mlp.gate.weight"] = gate_weight  
+    weights[f"{trt_prefix}.mlp.fc.weight"] = up_weight
     
     # Down projection
     down_weight = hf_state_dict[f"{hf_prefix}.mlp.down_proj.weight"]
@@ -228,7 +220,6 @@ def convert_normalization_weights(
     trt_prefix: str, 
     config: Exaone4Config
 ):
-    """Convert normalization weights for Post-norm architecture."""
     
     if config.use_post_norm:
         # Post-attention layer norm (Exaone 4.0 specific)

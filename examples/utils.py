@@ -115,6 +115,9 @@ def read_model_name(engine_dir: str, is_hf: bool = False):
         model_version = config['pretrained_config']['chatglm_version']
     if 'qwen' in model_arch.lower():
         model_version = config['pretrained_config']['qwen_type']
+    if 'exaone' in model_arch.lower():
+        # ExaONE model version handling
+        model_version = 'exaone'
     return model_arch, model_version
 
 
@@ -182,6 +185,9 @@ def _load_tokenizer(tokenizer_dir: Optional[str] = None,
     elif 'GLM' in model_name and model_version == 'glm':
         pad_id = tokenizer.pad_token_id
         end_id = tokenizer.eop_token_id
+    elif 'exaone' in model_name.lower():
+        pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+        end_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 361
     elif tokenizer_type == 'language_adapter':
         pad_id = 0
         end_id = 2
